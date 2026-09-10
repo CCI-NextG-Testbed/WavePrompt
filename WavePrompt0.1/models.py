@@ -124,7 +124,7 @@ class DiA(nn.Module):
         mod_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + \
             gate_msa.unsqueeze(
-                1) * self.attn(mod_x, mod_x, mod_x)
+                1) * self.attn(mod_x)
         x = x + \
             gate_mlp.unsqueeze(
                 1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))

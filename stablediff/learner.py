@@ -17,92 +17,17 @@ try:
 except Exception:
     rfml_evm = None
 
-class tfdiffLoss(nn.Module):
-    def __init__(self, w=0.1):
-        super().__init__()
-        self.w = w
-
-    def forward(self, target, est, target_noise=None, est_noise=None):
-        target_c = torch.view_as_complex(target).squeeze(-1)
-        est_c = torch.view_as_complex(est).squeeze(-1)
-        target_fft = torch.fft.fft(target_c, dim=1)
-        est_fft = torch.fft.fft(est_c, dim=1)
-        t_loss = self.complex_mse_loss(target, est)
-        f_loss = torch.mean(torch.abs(target_fft - est_fft) ** 2)
-        n_loss = (
-            self.complex_mse_loss(target_noise, est_noise)
-            if target_noise is not None and est_noise is not None
-            else torch.tensor(0.0, device=target.device, dtype=target.dtype)
-        )
-        return (t_loss + f_loss + self.w * n_loss)
-
-    def complex_mse_loss(self, target, est):
-        target = torch.view_as_complex(target)
-        est = torch.view_as_complex(est)
-        return torch.mean(torch.abs(target-est)**2)
-
-class IQPlusBitsLoss(nn.Module):
-    def __init__(self, w_time=0.5, eps=1e-8):
-        super().__init__()
-        self.w_time = min(max(float(w_time), 0.0), 1.0)
-        self.w_evm = 1.0 - self.w_time
-        self.eps = eps
-
-    @staticmethod
-    def complex_mse(target_ri, est_ri):
-        # target_ri, est_ri: [B,N,1,2] float
-        target_c = torch.view_as_complex(target_ri)  # [B,N,1]
-        est_c    = torch.view_as_complex(est_ri)
-        return torch.mean(torch.abs(target_c - est_c) ** 2)
-
-    def _symbol_evm_loss(self, est_c, target_c, sps):
-        # est_c, target_c: [B,N] complex
-        B, N = est_c.shape
-        losses = []
-        for i in range(B):
-            sps_i = max(1, int(sps[i].item()))
-            T = N // sps_i
-            if T <= 0:
-                continue
-
-            est_i = est_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
-            tgt_i = target_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
-
-            if rfml_evm is not None:
-                est_ri = torch.stack((est_i.real, est_i.imag), dim=0).unsqueeze(0).unsqueeze(0)  # [1,1,2,T]
-                tgt_ri = torch.stack((tgt_i.real, tgt_i.imag), dim=0).unsqueeze(0).unsqueeze(0)  # [1,1,2,T]
-                losses.append(torch.mean(rfml_evm(est_ri, tgt_ri)))
-            else:
-                num = torch.mean(torch.abs(est_i - tgt_i) ** 2)
-                den = torch.mean(torch.abs(tgt_i) ** 2).clamp(min=self.eps)
-                losses.append(torch.sqrt(num / den))
-
-        if len(losses) == 0:
-            return torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
-        return torch.stack(losses).mean()
-
-    def forward(self, target_ri, est_ri, sps=None, return_components=False):
-        l_iq = self.complex_mse(target_ri, est_ri)
-
-        target_c = torch.view_as_complex(target_ri).squeeze(-1)  # [B,N]
-        est_c = torch.view_as_complex(est_ri).squeeze(-1)        # [B,N]
-        l_evm = torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
-        if sps is not None:
-            l_evm = self._symbol_evm_loss(est_c, target_c, sps)
-
-        if return_components:
-            return l_iq, l_evm
-
-        loss = self.w_time * l_iq + self.w_evm * l_evm
-        return loss
-        
 
 class tfdiffLearner:
-    def __init__(self, log_dir, model_dir, model, dataset, optimizer, params, *args, **kwargs):
+    def __init__(self, log_dir, model_dir, model, clip_model, encoder, decoder, tokenizer, dataset, optimizer, params, *args, **kwargs):
         os.makedirs(model_dir, exist_ok=True)
         self.model_dir = model_dir
         self.log_dir = log_dir
         self.model = model
+        self.clip_model = clip_model
+        self.encoder = encoder
+        self.decoder = decoder
+        self.tokenizer = tokenizer
         self.dataset = dataset
         self.val_dataset = kwargs.get("val_dataset", None)
         self.optimizer = optimizer
@@ -114,10 +39,6 @@ class tfdiffLearner:
         self.params = params
         self.iter = 0
         self.is_master = True
-        self.loss_fn_rf_diff = tfdiffLoss(w=float(getattr(params, "loss_w_fft", 0.1)))
-        self.loss_fn_iq_plus_bits = IQPlusBitsLoss(
-            w_time=float(getattr(params, "loss_w_time", 0.5)),
-        )
         self.loss_fn = self.loss_fn_rf_diff if bool(getattr(params, "use_tfdiff_loss", False)) else self.loss_fn_iq_plus_bits
         self.summary_writer = None
         self.epoch_history = []
@@ -181,89 +102,6 @@ class tfdiffLearner:
         except FileNotFoundError:
             return False
 
-    @staticmethod
-    def _mat_to_str(x):
-        if isinstance(x, str):
-            return x
-        if isinstance(x, (bytes, bytearray)):
-            return x.decode("utf-8", errors="ignore")
-        arr = np.asarray(x)
-        if arr.dtype == object:
-            if arr.size == 0:
-                return ""
-            return tfdiffLearner._mat_to_str(arr.ravel()[0])
-        if arr.dtype.kind in ("U", "S"):
-            return "".join(arr.ravel().astype(str).tolist())
-        if arr.size == 1:
-            return str(arr.item())
-        return str(arr)
-
-    @staticmethod
-    def _normalize_modulation_text(x: str) -> str:
-        s = str(x).upper()
-        s = "".join(ch for ch in s if ch.isalnum())
-        for m in ("BPSK", "QPSK", "8PSK", "16QAM", "64QAM", "256QAM"):
-            if m in s:
-                return m
-        return s
-
-    @staticmethod
-    def _to_complex_1d(arr):
-        a = np.asarray(arr)
-        if np.iscomplexobj(a):
-            return a.reshape(-1).astype(np.complex64, copy=False)
-        if a.ndim >= 1 and a.shape[-1] == 2:
-            return (a[..., 0] + 1j * a[..., 1]).reshape(-1).astype(np.complex64, copy=False)
-        return (a.astype(np.float32) + 0j).reshape(-1).astype(np.complex64, copy=False)
-
-    def _load_one_mod_sample(self, data_dir: str, mod: str):
-        mats = sorted([os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.lower().endswith(".mat")])
-        for p in mats:
-            m = scio.loadmat(p, verify_compressed_data_integrity=False)
-            if "data" not in m:
-                continue
-            raw = self._mat_to_str(m["modulation"]) if "modulation" in m else ""
-            mod_name = self._normalize_modulation_text(raw)
-            if mod_name != mod:
-                continue
-            x = self._to_complex_1d(m["data"])
-            sps = int(np.asarray(m["samples_per_symbol"]).squeeze()) if "samples_per_symbol" in m else 1
-            bits = np.asarray(m["bits"]).reshape(-1).astype(np.float32) if "bits" in m else np.zeros((0,), dtype=np.float32)
-            bits = (bits != 0).astype(np.float32)
-            label = self._mat_to_str(m["label"]) if "label" in m else f"Generate a {mod} signal."
-            return {"x": x, "sps": max(1, sps), "bits": bits, "label": str(label), "mod": mod_name}
-        raise RuntimeError(f"No sample found for modulation {mod} in {data_dir}")
-
-    @staticmethod
-    def _mod_order(mod: str) -> int:
-        m = str(mod).upper()
-        if m == "BPSK":
-            return 2
-        if m == "QPSK":
-            return 4
-        if m == "8PSK":
-            return 8
-        if m == "16QAM":
-            return 16
-        if m == "64QAM":
-            return 64
-        if m == "256QAM":
-            return 256
-        return 2
-
-    @staticmethod
-    def _bits_per_symbol(mod: str) -> int:
-        return int(np.log2(tfdiffLearner._mod_order(mod)))
-
-    @staticmethod
-    def _bits_to_symbol_index(bits: np.ndarray, k: int) -> np.ndarray:
-        if bits.size < k:
-            return np.zeros((0,), dtype=np.float32)
-        T = bits.size // k
-        bb = bits[: T * k].reshape(T, k).astype(np.int64)
-        w = (2 ** np.arange(k - 1, -1, -1)).astype(np.int64)
-        return (bb * w[None, :]).sum(axis=1).astype(np.float32)
-
     def _build_bits_cond(self, bits: np.ndarray, mod: str, sps: int, N: int) -> np.ndarray:
         bits = np.asarray(bits).reshape(-1)
         bits = (bits != 0).astype(np.float32)
@@ -292,253 +130,17 @@ class tfdiffLearner:
         x_ri = torch.view_as_real(x_t).to(torch.float32)  # [N,1,2]
         return x_ri
 
-    def _save_epoch_snapshot(self, epoch_idx: int):
-        if not self.is_master:
-            return
-        if not bool(getattr(self.params, "animate_after_training", False)):
-            return
-        try:
-            data_roots = list(getattr(self.params, "data_dir", []))
-            if len(data_roots) == 0:
-                return
-            data_dir = data_roots[0]
-            mods = list(getattr(self.params, "training_animation_mods", ["BPSK", "QPSK", "8PSK", "16QAM"]))
-            mods = [str(m).upper() for m in mods][:4]
-            N = int(getattr(self.params, "sample_rate", 2048))
-            device = next(self.model.parameters()).device
-
-            os.makedirs(self.snapshot_dir, exist_ok=True)
-            probe = {m: self._load_one_mod_sample(data_dir, m) for m in mods}
-
-            was_training = self.model.training
-            self.model.eval()
-            payload = {"epoch": np.array([int(epoch_idx)], dtype=np.int32)}
-            with torch.no_grad():
-                for m in mods:
-                    s = probe[m]
-                    x_ri = self._prepare_model_input_ri(s["x"], N=N, device=device)  # [N,1,2]
-                    bits_cond = self._build_bits_cond(s["bits"], mod=s["mod"], sps=s["sps"], N=N)
-                    bits_t = torch.from_numpy(bits_cond.astype(np.float32)).unsqueeze(0).to(device)
-
-                    x_b = x_ri.unsqueeze(0)  # [1,N,1,2]
-                    cond = {"prompt": [s["label"]], "bits_cond": bits_t}
-                    pred = self.diffusion.sampling(self.model, cond, device)  # [1,N,1,2]
-
-                    tar_c = torch.view_as_complex(x_b).squeeze(-1).squeeze(0).detach().cpu().numpy().astype(np.complex64)
-                    prd_c = torch.view_as_complex(pred).squeeze(-1).squeeze(0).detach().cpu().numpy().astype(np.complex64)
-
-                    payload[f"{m}_target"] = tar_c
-                    payload[f"{m}_pred"] = prd_c
-                    payload[f"{m}_sps"] = np.array([int(s["sps"])], dtype=np.int32)
-            if was_training:
-                self.model.train()
-
-            snap_path = os.path.join(self.snapshot_dir, f"snapshot_epoch_{int(epoch_idx):06d}.npz")
-            np.savez_compressed(snap_path, **payload)
-        except Exception as e:
-            print(f"[warn] failed to save epoch snapshot {epoch_idx}: {e}")
-
-    def _batch_modulation_evm(self, target_ri, est_ri, modulation, sps):
-        if modulation is None or sps is None:
-            return {}
-        target_c = torch.view_as_complex(target_ri).squeeze(-1)
-        est_c = torch.view_as_complex(est_ri).squeeze(-1)
-        evm_by_mod = {}
-        count_by_mod = {}
-        for i, mod in enumerate(modulation):
-            mod_name = str(mod).upper()
-            evm_i = float(
-                self.loss_fn_iq_plus_bits._symbol_evm_loss(
-                    est_c[i:i + 1],
-                    target_c[i:i + 1],
-                    sps[i:i + 1],
-                ).detach().item()
-            )
-            evm_by_mod[mod_name] = evm_by_mod.get(mod_name, 0.0) + evm_i
-            count_by_mod[mod_name] = count_by_mod.get(mod_name, 0) + 1
-        return {mod: evm_by_mod[mod] / max(1, count_by_mod[mod]) for mod in evm_by_mod}
-
-    def _write_convergence_csv(self, epoch_idx: int, train_loss: float, test_loss: float, evm_by_mod: dict):
-        mods = sorted(set(self.train_modulation_counts.keys()) | set(self.test_modulation_counts.keys()) | set(evm_by_mod.keys()))
-        row = {
-            "epoch": int(epoch_idx),
-            "train_loss": float(train_loss),
-            "test_loss": float(test_loss),
-            "train_sample_count": int(self.train_sample_count),
-        }
-        for mod in mods:
-            row[f"test_evm_{mod}"] = float(evm_by_mod.get(mod, float("nan")))
-
-        fieldnames = list(row.keys())
-        os.makedirs(os.path.dirname(os.path.abspath(self.metrics_csv_path)) or ".", exist_ok=True)
-        write_header = not os.path.exists(self.metrics_csv_path)
-        with open(self.metrics_csv_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
-
-    def _evaluate_reverse_diffusion(self):
-        if self.val_dataset is None:
-            return float("nan"), {}
-        device = next(self.model.parameters()).device
-        was_training = self.model.training
-        self.model.eval()
-        loss_sum = 0.0
-        loss_count = 0
-        mod_evm_sum = {}
-        mod_evm_count = {}
-        with torch.no_grad():
-            for features in self.val_dataset:
-                features = _nested_map(
-                    features,
-                    lambda x: x.to(device) if isinstance(x, torch.Tensor) else x
-                )
-
-                data = features['data']
-                prompts = features['prompt']
-                bits_cond = features.get('bits_cond', features.get('bits', None))
-                modulation = features.get('modulation', None)
-                sps = features.get('samples_per_symbol', None)
-
-                cond = {'prompt': prompts, 'bits_cond': bits_cond}
-                predicted = self.diffusion.sampling(self.model, cond, device)
-
-                base_loss = self._base_loss(data, predicted, sps=sps)
-
-                model_ref = self.model.module if hasattr(self.model, "module") else self.model
-                mod_logits = getattr(model_ref, "last_mod_logits", None)
-                mod_loss = torch.tensor(0.0, device=data.device, dtype=torch.float32)
-                if mod_logits is not None and modulation is not None:
-                    ids = []
-                    for m in modulation:
-                        key = str(m).upper().replace("-", "").replace(" ", "")
-                        ids.append(model_ref.mod_to_id.get(key, 0))
-                    target = torch.tensor(ids, dtype=torch.long, device=mod_logits.device)
-                    mod_loss = F.cross_entropy(mod_logits, target)
-
-                mod_loss_weight = float(getattr(self.params, "mod_loss_weight", 0.0))
-                loss = base_loss + mod_loss_weight * mod_loss
-                loss_sum += float(loss.item())
-                loss_count += 1
-
-                batch_evm = self._batch_modulation_evm(data, predicted, modulation, sps)
-                for mod, evm_val in batch_evm.items():
-                    mod_evm_sum[mod] = mod_evm_sum.get(mod, 0.0) + float(evm_val)
-                    mod_evm_count[mod] = mod_evm_count.get(mod, 0) + 1
-
-        if was_training:
-            self.model.train()
-        if loss_count == 0:
-            return float("nan"), {}
-        evm_by_mod = {mod: mod_evm_sum[mod] / max(1, mod_evm_count[mod]) for mod in mod_evm_sum}
-        return loss_sum / float(loss_count), evm_by_mod
 
     def _base_loss(self, target_ri, est_ri, sps=None):
         if self.loss_fn is self.loss_fn_rf_diff:
             return self.loss_fn(target_ri, est_ri)
         return self.loss_fn(target_ri, est_ri, sps=sps)
 
-    def _symbol_rate_view(self, x: np.ndarray, sps: int, max_symbols: int):
-        T = min(len(x) // sps, max_symbols)
-        if T <= 0:
-            return np.zeros((0,), dtype=np.complex64)
-        return x[: T * sps].reshape(T, sps).mean(axis=1)
-
-    def _generate_training_animation(self):
-        if not self.is_master:
-            return
-        if not bool(getattr(self.params, "animate_after_training", False)):
-            return
-
-        try:
-            out_path = str(getattr(self.params, "training_animation_out", "./results/training_mods.gif"))
-            mods = list(getattr(self.params, "training_animation_mods", ["BPSK", "QPSK", "8PSK", "16QAM"]))
-            mods = [str(m).upper() for m in mods][:4]
-            max_symbols = int(getattr(self.params, "training_animation_max_symbols", 256))
-            fps = int(getattr(self.params, "training_animation_fps", 2))
-            snap_files = sorted(glob.glob(os.path.join(self.snapshot_dir, "snapshot_epoch_*.npz")))
-            if len(snap_files) == 0:
-                print("[warn] animation skipped: no epoch snapshots found")
-                return
-            snapshots = [np.load(p, allow_pickle=True) for p in snap_files]
-            epochs = np.asarray([int(s["epoch"][0]) for s in snapshots], dtype=np.int64)
-
-            nmods = max(1, len(mods))
-            ncols = 2 if nmods > 1 else 1
-            nrows = int(np.ceil(nmods / float(ncols)))
-            fig, ax_grid = plt.subplots(nrows, ncols, figsize=(7.0 * ncols, 6.5 * nrows))
-            ax_const = np.atleast_1d(ax_grid).ravel().tolist()
-            for ax in ax_const[nmods:]:
-                ax.set_visible(False)
-            pred_scats = []
-            for i, mod in enumerate(mods):
-                s0 = snapshots[0]
-                target = np.asarray(s0[f"{mod}_target"])
-                pred = np.asarray(s0[f"{mod}_pred"])
-                sps = int(np.asarray(s0[f"{mod}_sps"]).squeeze())
-
-                target_sym = self._symbol_rate_view(target, sps=sps, max_symbols=max_symbols)
-                pred_sym = self._symbol_rate_view(pred, sps=sps, max_symbols=max_symbols)
-                ax_const[i].scatter(
-                    np.real(target_sym), np.imag(target_sym),
-                    s=10, c="gray", alpha=0.45, label="Tx"
-                )
-                pred_sc = ax_const[i].scatter(np.real(pred_sym), np.imag(pred_sym), s=10, c="tab:orange", alpha=0.9, label="Pred")
-                pred_scats.append((pred_sc, sps))
-
-                ax_const[i].axhline(0, color="k", lw=0.6, ls="--")
-                ax_const[i].axvline(0, color="k", lw=0.6, ls="--")
-                ax_const[i].set_title(f"{mod} Symbols")
-                ax_const[i].set_xlabel("I")
-                ax_const[i].set_ylabel("Q")
-                ax_const[i].set_aspect("equal", adjustable="box")
-                ax_const[i].set_xlim(-2.0, 2.0)
-                ax_const[i].set_ylim(-2.0, 2.0)
-                ax_const[i].grid(True, alpha=0.3)
-                ax_const[i].legend(loc="upper right", fontsize=8)
-
-            title = fig.suptitle("", fontsize=12)
-
-            def _update(k):
-                e = epochs[k]
-                s = snapshots[k]
-                for i, mod in enumerate(mods):
-                    pred = np.asarray(s[f"{mod}_pred"])
-                    pred_sc, sps = pred_scats[i]
-                    pred_sym = self._symbol_rate_view(pred, sps=sps, max_symbols=max_symbols)
-                    pts = np.column_stack([np.real(pred_sym), np.imag(pred_sym)]) if len(pred_sym) else np.zeros((0, 2))
-                    pred_sc.set_offsets(pts)
-                title.set_text(f"Epoch {int(e)}")
-                artists = [title]
-                artists.extend([x[0] for x in pred_scats])
-                return artists
-
-            ani = animation.FuncAnimation(
-                fig,
-                _update,
-                frames=len(epochs),
-                interval=max(1, int(1000 / max(1, fps))),
-                blit=False,
-                repeat=True,
-            )
-
-            os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-            if out_path.lower().endswith(".gif"):
-                ani.save(out_path, writer=animation.PillowWriter(fps=fps))
-            else:
-                ani.save(out_path, writer="ffmpeg", fps=fps)
-            plt.close(fig)
-            print(f"Saved training animation: {out_path}")
-        except Exception as e:
-            print(f"[warn] failed to generate training animation: {e}")
 
     def train(self, max_iter=None):
         device = next(self.model.parameters()).device
         stop_training = False
         while True:  # epoch
-            epoch_loss_sum = 0.0        # <<< NEW
-            epoch_loss_count = 0        # <<< NEW
 
             epoch_idx = self.iter // len(self.dataset)
             iterator = tqdm(self.dataset, desc=f"Epoch {epoch_idx}") if self.is_master else self.dataset
@@ -622,41 +224,33 @@ class tfdiffLearner:
         data = features['data']          # [B, ...]
         prompts = features['prompt']     # list[str]
         bits_cond = features.get('bits_cond', features.get('bits', None)) # [B, N] or None
-        modulation = features.get('modulation', None)
-        sps = features.get('samples_per_symbol', None)
 
-        B = data.shape[0]
+        #Call CVAE Class
+        latent = self.encoder(data)
+
+        B = latent.shape[0]
         t = torch.randint(0, self.diffusion.max_step, [B], dtype=torch.int64, device=data.device)
 
-        degrade_data = self.diffusion.degrade_fn(data, t)
+        degrade_data, noise = self.diffusion.degrade_fn(latent, t)
 
-        # model must accept prompts as list[str] and embed them internally
-        # pass conditioning as a dict to support both prompt (text) and bits
         cond = {'prompt': prompts, 'bits': bits_cond}
-        predicted = self.model(degrade_data, t, cond)
 
-        base_loss = self._base_loss(data, predicted, sps=sps)
+        tokens = self.tokenizer.batch_encode_plus(
+                [cond["prompt"]], padding="max_length", max_length=77
+            ).input_ids
+        tokens = torch.tensor(tokens, dtype=torch.long, device=data.device)
+        context = self.clip(tokens)
+        cond["prompt"] = context
 
-        # Supervise learned prompt->modulation routing head.
-        model_ref = self.model.module if hasattr(self.model, "module") else self.model
-        mod_logits = getattr(model_ref, "last_mod_logits", None)
-        mod_loss = torch.tensor(0.0, device=data.device, dtype=torch.float32)
-        if mod_logits is not None and modulation is not None:
-            ids = []
-            for m in modulation:
-                key = str(m).upper().replace("-", "").replace(" ", "")
-                ids.append(model_ref.mod_to_id.get(key, 0))
-            target = torch.tensor(ids, dtype=torch.long, device=mod_logits.device)
-            mod_loss = F.cross_entropy(mod_logits, target)
+        predicted_noise = self.model(degrade_data, t, cond)
 
-        mod_loss_weight = float(getattr(self.params, "mod_loss_weight", 0.0))
-        loss = base_loss + mod_loss_weight * mod_loss
-        loss.backward()
-        self.grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.params.max_grad_norm or 1e9
+        loss = torch.mean(
+            torch.abs(predicted_noise - noise) ** 2
         )
+        
+        loss.backward()
         self.optimizer.step()
-        return loss
+        return loss.item()
 
 
     def _write_summary(self, iter, features, loss):

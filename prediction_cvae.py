@@ -47,9 +47,9 @@ def main(args):
     # Normalize like training
     x = x / np.sqrt(np.mean(np.abs(x) ** 2))
 
-    # [1, 1, 4096, 1]
+    # [1, 1, 4096]
     x = torch.from_numpy(x.astype(np.complex64))
-    x = x.view(1, 1, args.N, 1).to(device)
+    x = x.view(1, 1, args.N).to(device)
 
     # -----------------------------
     # Reconstruction

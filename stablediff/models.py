@@ -8,6 +8,7 @@ from sentence_transformers import SentenceTransformer
 
 import complex.complex_module as cm
 import complex.complex_layers as cm_l
+import complex.complex_functions as cm_f
 
 
 def init_weight_norm(module):
@@ -99,16 +100,16 @@ class ComplexUNet(nn.Module):
         super().__init__()
 
         self.encoder = nn.Module([
-            cm.ComplexSwitchSequential(cm_l.ComplexConv2d(4, 320, kernel_size=3, padding=1)),
+            cm.ComplexSwitchSequential(cm_l.ComplexConv1d(4, 320, kernel_size=3, padding=1)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320),  cm.ComplexUNet_AttentionBlock(8, 40)),
-            cm.ComplexSwitchSequential(cm_l.ComplexConv2d(320, 320, kernel_size=3, stride=2, padding=1)),
+            cm.ComplexSwitchSequential(cm_l.ComplexConv1d(320, 320, kernel_size=3, stride=2, padding=1)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 640),  cm.ComplexUNet_AttentionBlock(8, 80)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 640),  cm.ComplexUNet_AttentionBlock(8, 80)),
-            cm.ComplexSwitchSequential(cm_l.ComplexConv2d(640, 640, kernel_size=3, stride=2, padding=1)),
+            cm.ComplexSwitchSequential(cm_l.ComplexConv1d(640, 640, kernel_size=3, stride=2, padding=1)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 1280),  cm.ComplexUNet_AttentionBlock(8, 160)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280),  cm.ComplexUNet_AttentionBlock(8, 160)),
-            cm.ComplexSwitchSequential(cm_l.ComplexConv2d(1280, 1280, kernel_size=3, stride=2, padding=1)),
+            cm.ComplexSwitchSequential(cm_l.ComplexConv1d(1280, 1280, kernel_size=3, stride=2, padding=1)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280)),
         ])
@@ -154,12 +155,12 @@ class ComplexUNet(nn.Module):
 class ComplexUNet_OutputLayer(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.groupnorm = nn.GroupNorm(num_groups=32, num_channels=in_channels)
-        self.conv = cm_l.ComplexConv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.groupnorm = cm_l.ComplexGroupNorm(num_groups=32, num_channels=in_channels)
+        self.conv = cm_l.ComplexConv1d(in_channels, out_channels, kernel_size=3, padding=1)
 
     def forward(self, x):
         x = self.groupnorm(x)
-        x = F.silu(x)
+        x = cm_f.complex_silu(x)
         x = self.conv(x)
         return x
 
@@ -189,10 +190,52 @@ class stablediff_Simple(nn.Module):
         self.unet = ComplexUNet()
         self.final = ComplexUNet_OutputLayer(320, 4)
 
-    def forward(self, latent, context, time):
-        time = self.t_embed(time)
+    def _encode_bits_seq(self, bits, device, N):
+        """
+        bits: [B,N] 0/1 (or [B,N,1])
+        return: [B,N,H,2]
+        """
+        if bits is None:
+            return None
+        if not isinstance(bits, torch.Tensor):
+            bits = torch.tensor(bits, dtype=torch.float32, device=device)
+        else:
+            bits = bits.to(device).float()
 
-        output = self.unet(latent, context, time)
+        if bits.ndim == 1:
+            bits = bits.unsqueeze(0)  # [1,N]
+        if bits.shape[1] != N:
+            # If mismatch, you need a mapping from samples->symbols (oversampling etc.)
+            # For now, truncate/pad as a safe fallback:
+            if bits.shape[1] > N:
+                bits = bits[:, :N]
+            else:
+                pad = torch.zeros(bits.shape[0], N - bits.shape[1], device=device)
+                bits = torch.cat([bits, pad], dim=1)
+
+        bits = bits.unsqueeze(-1)  # [B,N,1]
+        B = bits.shape[0]
+        b = self.bits_token(bits)              # [B,N,2H]
+        b = b.view(B, N, self.hidden_dim, 2)   # [B,N,H,2]
+        return b
+
+    def forward(self, latent, time, cond):
+        device = latent.device
+
+        B, N = latent.shape[0], latent.shape[1]
+
+        prompt_input = cond.get("prompt") if isinstance(cond, dict) else cond
+        bits_input   = None
+        if isinstance(cond, dict):
+            bits_input = cond.get("bits_cond", cond.get("bits"))
+
+        time = self.t_embed(time)
+        
+        b_seq = self._encode_bits_seq(bits_input, device, N)  # [B,N,H,2] or None
+        if b_seq is not None:
+            latent = latent + b_seq
+
+        output = self.unet(latent, prompt_input, time)
         output = self.final(output)
 
         return output

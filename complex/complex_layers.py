@@ -11,8 +11,8 @@ Based on https://openreview.net/forum?id=H1T2hmZAb
 
 import torch
 from torch.nn import Module, Parameter, init
-from torch.nn import Conv2d, Conv3d, Linear, BatchNorm1d, BatchNorm2d, BatchNorm3d, LayerNorm, GroupNorm
-from torch.nn import ConvTranspose2d
+from torch.nn import Conv1d, Conv2d, Conv3d, Linear, BatchNorm1d, BatchNorm2d, BatchNorm3d, LayerNorm, GroupNorm
+from torch.nn import ConvTranspose2d, ConvTranspose1d
 from .complex_functions import complex_relu, complex_max_pool2d, complex_avg_pool2d, complex_max_pool3d
 from .complex_functions import complex_dropout, complex_dropout2d, complex_dropout3d
 from .complex_functions import complex_sigmoid, complex_tanh, complex_opposite
@@ -123,6 +123,23 @@ class ComplexTanh(Module):
      def forward(self,input):
          return complex_tanh(input)
 
+class ComplexConvTranspose1d(Module):
+
+    def __init__(self,in_channels, out_channels, kernel_size, stride=1, padding=0,
+                 output_padding=0, groups=1, bias=True, dilation=1, padding_mode='zeros'):
+
+        super(ComplexConvTranspose1d, self).__init__()
+
+        self.conv_tran_r = ConvTranspose1d(in_channels, out_channels, kernel_size, stride, padding,
+                                       output_padding, groups, bias, dilation, padding_mode)
+        self.conv_tran_i = ConvTranspose1d(in_channels, out_channels, kernel_size, stride, padding,
+                                       output_padding, groups, bias, dilation, padding_mode)
+
+
+    def forward(self,input):
+        return apply_complex(self.conv_tran_r, self.conv_tran_i, input)
+
+
 class ComplexConvTranspose2d(Module):
 
     def __init__(self,in_channels, out_channels, kernel_size, stride=1, padding=0,
@@ -138,6 +155,28 @@ class ComplexConvTranspose2d(Module):
 
     def forward(self,input):
         return apply_complex(self.conv_tran_r, self.conv_tran_i, input)
+
+class ComplexConv1d(Module):
+
+    def __init__(self, in_channels, out_channels, kernel_size=3,
+                 stride=1, padding=0, dilation=1, groups=1, bias=True):
+        super(ComplexConv1d, self).__init__()
+
+        self.conv_r = Conv1d(
+            in_channels, out_channels,
+            kernel_size, stride, padding,
+            dilation, groups, bias
+        )
+
+        self.conv_i = Conv1d(
+            in_channels, out_channels,
+            kernel_size, stride, padding,
+            dilation, groups, bias
+        )
+
+    def forward(self, input):
+        return apply_complex(self.conv_r, self.conv_i, input)
+
 
 class ComplexConv2d(Module):
 

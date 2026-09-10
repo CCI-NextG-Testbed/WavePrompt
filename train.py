@@ -5,18 +5,25 @@ from argparse import ArgumentParser
 
 from stablediff.params import params_simple
 from stablediff.learner import tfdiffLearner
-from stablediff.models import tfdiff_WiFi
-from stablediff.models import tfdiff_Simple
-from stablediff.dataset import from_path_modulation_holdout
+from stablediff.models import stablediff_Simple
+from stablediff.clip import CLIP
+from stablediff.dataset import from_path_split
+from transformers import CLIPTokenizer
+from stablediff.CVAE import ComplexEncoder, ComplexDecoder
+from stablediff.model_converter import load_from_standard_weights
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-def _train_impl(replica_id, model, dataset, params, val_dataset=None):
+def _train_impl(replica_id, model, clip_model, encoder, decoder, tokenizer, dataset, params, val_dataset=None):
     opt = torch.optim.AdamW(model.parameters(), lr=params.learning_rate)
     learner = tfdiffLearner(
         params.log_dir,
         params.model_dir,
         model,
+        clip_model,
+        encoder,
+        decoder,
+        tokenizer,
         dataset,
         opt,
         params,
@@ -28,15 +35,37 @@ def _train_impl(replica_id, model, dataset, params, val_dataset=None):
 
 
 def train(params):
-    dataset, val_dataset = from_path_modulation_holdout(
-        params,
-        test_per_mod=int(getattr(params, "test_per_mod", 1)),
-        mods=tuple(getattr(params, "test_mods", ["BPSK", "QPSK", "8PSK"])),
-        split_seed=int(getattr(params, "split_seed", 42)),
-    )
+    dataset, val_dataset = from_path_split(params)
+    state_dict = load_from_standard_weights(
+        os.path.join(params.tokenizer_dir,"v1-5-pruned-emaonly.ckpt"), device)
     device = torch.device('cpu', 0)
-    model = tfdiff_Simple(params).to(device)
-    _train_impl(0, model, dataset, params, val_dataset=val_dataset)
+
+    model = stablediff_Simple(params).to(device)
+
+    clip_model = CLIP().to(device)
+    clip_model.load_state_dict(state_dict['clip'], strict=True)
+    tokenizer = CLIPTokenizer(os.path.join(params.tokenizer_dir, "vocab.json"), 
+                            merges_file=os.path.join(params.tokenizer_dir, "merges.txt"))
+    
+    encoder = ComplexEncoder(params.latent_dims).to(device)
+    decoder = ComplexDecoder(params.latent_dims).to(device)
+
+    checkpoint = torch.load(
+        params.cvae_model_dir,
+        map_location=device
+    )
+
+    encoder.load_state_dict(
+        checkpoint["encoder_state_dict"]
+    )
+
+    decoder.load_state_dict(
+        checkpoint["decoder_state_dict"]
+    )
+
+    encoder.eval()
+    decoder.eval()
+    _train_impl(0, model, clip_model, encoder, decoder, tokenizer, dataset, params, val_dataset=val_dataset)
 
 def main(args):
     params = params_simple

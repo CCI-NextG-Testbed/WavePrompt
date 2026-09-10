@@ -100,7 +100,7 @@ class SignalDiffusion(nn.Module):
         torch.manual_seed(11)
         noise =  noise_weight * torch.randn_like(x_0, dtype=torch.float32, device=device) # [B, N, S, A, 2]
         x_t = info_weight * x_0 + noise # [B, N, S, A, 2]
-        return x_t
+        return x_t, noise
 
 
     def sampling(self, restore_fn, cond, device):

@@ -17,18 +17,16 @@ class AttrDict(dict):
         return self
 
 params_simple = AttrDict(
-    log_dir='./log/stablediff',
-    model_dir='./model/stablediff',
-    cvae_model_dir='./dataset/stablediff/cvae_training/cvae_model',
-    cvae_gif_dir='./dataset/stablediff/cvae_training',
-    out_dir='./dataset/stablediff/output/prediction.mat',
-    data_dir=['./dataset/stablediff/raw', './dataset/simple/raw'],  # list of folders
-    tokenizer_dir ="./dataset/stablediff/tokenizer",
+    log_dir='./log/simple',
+    model_dir='./model/simple',
+    cvae_model_dir='./cvae_training/cvae_model',
+    out_dir='./dataset/simple/output/prediction.mat',
+    data_dir=['./dataset/simple/raw'],  # list of folders
     max_iter=None,
     inference_batch_size=1,
     robust_sampling=True,
     batch_size=1,
-    learning_rate=3e-5,
+    learning_rate=1e-5,
     max_grad_norm=None,
     use_tfdiff_loss=False,
     loss_w_fft=0.1,
@@ -42,7 +40,6 @@ params_simple = AttrDict(
     input_dim=1,
     extra_dim=[1],
     embed_dim=128,
-    latent_dims=250,
     hidden_dim=64,
     num_heads=4,
     num_block=8,

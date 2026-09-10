@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import re
 import random
 import torch
 import torch.nn.functional as F
@@ -63,15 +64,13 @@ class SimpleSignalDataset(torch.utils.data.Dataset):
         """
         Normalize messy MATLAB/object-string modulation values into canonical tokens.
         Examples handled:
-          "['QPSK']" -> "QPSK"
-          " qpsk "   -> "QPSK"
+        "['QPSK']" -> "QPSK"
+        " qpsk "   -> "QPSK"
+        "['128qam']" -> "128QAM"
         """
-        s = str(x).upper()
-        s = "".join(ch for ch in s if ch.isalnum())
-        for m in ("256QAM", "64QAM", "16QAM", "8PSK", "QPSK", "BPSK"):
-            if m in s:
-                return m
-        return "BPSK"
+        # Extract alphanumeric sequence(s), join them, and return lowercase
+        clean_str = "".join(re.findall(r'[a-zA-Z0-9]+', str(x)))
+        return clean_str.upper()
 
     @staticmethod
     def _mat_to_str(x) -> str:
@@ -145,6 +144,7 @@ class SimpleSignalDataset(torch.utils.data.Dataset):
             "label": label, # str
             "modulation": modulation,
             "samples_per_symbol": max(1, sps),
+            "filename": cur_filename
         }
 
 
@@ -173,6 +173,7 @@ class Collator:
         data_list = []
         bits_list = []
         prompt_list = []
+        modulation_list = []
 
         for record in minibatch:
             # ---------- IQ ----------
@@ -202,7 +203,7 @@ class Collator:
             elif L > N:
                 x_c = x_c[:N]
 
-            x_c = x_c.view(1, N, 1)
+            x_c = x_c.view(1, N)
             # [1, N, 1] complex64
 
             data_list.append(x_c)
@@ -234,6 +235,7 @@ class Collator:
             b_t = (b_t != 0).astype(np.float32)
 
             bits_list.append(torch.from_numpy(b_t))  # [N]
+            modulation_list.append(record["modulation"])
 
         data = torch.stack(data_list, dim=0)         # [B,1,N,1]
         bits = torch.stack(bits_list, dim=0)         # [B,N]
@@ -241,7 +243,8 @@ class Collator:
         return {
             "data": data,
             "prompt": prompt_list,
-            "bits": bits
+            "bits": bits,
+            "modulation": modulation_list,
         }
 
 def from_path(params, is_distributed=False):

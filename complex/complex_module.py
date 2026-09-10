@@ -363,67 +363,120 @@ class AttnMul(torch.autograd.Function):
 class CosineAttentionCausal(nn.Module):
     def __init__(self, num_heads, eps=1e-8):
         super().__init__()
-        self.dropout_p = dropout
         self.eps = eps
+        # norm_const of shape (1, H, 1, 1) like preprint
+        self.norm_const = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
 
-    def forward(self, queries, keys, values):
-        # Use real parts for score computation (stable baseline)
-        q_r = queries[..., 0]  # [Bh, Nq, D]
-        k_r = keys[..., 0]     # [Bh, Nk, D]
+    def forward(self, Q, K, V, s=None):
+        B, H, S, Dk = Q.shape
+        if s is None:
+            # match "sequence length at current timestep"
+            s = torch.tensor(float(S), device=Q.device, dtype=Q.dtype).view(1, 1, 1, 1)
 
-        # L2 normalize along feature dim D
-        qn = q_r / (q_r.norm(dim=-1, keepdim=True) + self.eps)
-        kn = k_r / (k_r.norm(dim=-1, keepdim=True) + self.eps)
+        # cosine normalization
+        Qn = F.normalize(Q, dim=-1, p=2, eps=self.eps)
+        Kn = F.normalize(K, dim=-1, p=2, eps=self.eps)
 
-        # scores: [Bh, Nq, Nk]
-        scores = torch.bmm(qn, kn.transpose(1, 2))
+        # V scaling per head
+        # Preprint line: V = V / s ** norm_const.sigmoid()
+        scale = s ** torch.sigmoid(self.norm_const)   # [1,H,1,1] broadcast over B,S,Dv
+        Vt = V / scale
 
-        # softmax over keys
-        attn = F.softmax(scores, dim=-1)
-
-        # dropout on attention weights (real)
-        if self.training and self.dropout_p and self.dropout_p > 0:
-            attn = F.dropout(attn, p=self.dropout_p)
-
-        # Convert to complex weights: real=attn, imag=0 so we can use complex_bmm
-        attn_c = torch.zeros(attn.shape[0], attn.shape[1], attn.shape[2], 2,
-                             device=attn.device, dtype=values.dtype)
-        attn_c[..., 0] = attn
-
-        # apply weights to complex values
-        out = complex_bmm(attn_c, values)  # [Bh, Nq, D, 2]
-        return out
+        return AttnMul.apply(Qn, Kn, Vt)
 
 
 class CosineComplexMultiHeadAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads, dropout=0.0, bias=True, eps=1e-8):
+    """
+    Complex multi-head block in correspondence with the preprint:
+      - Uses real(Q) and real(K) for cosine-normalized Q,K (stable baseline)
+      - Applies the preprint AttnMul causal operator to V_real and V_imag separately
+      - Re-stacks into complex output
+    """
+    def __init__(self, hidden_dim, num_heads, bias=True, eps=1e-8):
         super().__init__()
         self.num_heads = num_heads
-
-        self.attn = ComplexDotProductAttention(dropout=dropout, eps=eps)
+        self.eps = eps
 
         self.w_q = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
         self.w_k = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
         self.w_v = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
         self.w_o = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
 
-    def forward(self, queries, keys, values):
-        # Project
-        q = self.w_q(queries)
-        k = self.w_k(keys)
-        v = self.w_v(values)
+        self.attn = CosineAttentionCausal(num_heads=num_heads, eps=eps)
 
-        # Head split: [B,N,H,2] -> [B*heads, N, head_dim, 2]
-        q = transpose_qkv(q, self.num_heads)
-        k = transpose_qkv(k, self.num_heads)
-        v = transpose_qkv(v, self.num_heads)
+    def forward(self, x, s=None):
+        """
+        queries/keys/values: [B, S, hidden_dim, 2]
+        returns:            [B, S, hidden_dim, 2]
+        """
+        # project (complex)
+        q = self.w_q(x)
+        k = self.w_k(x)
+        v = self.w_v(x)
 
-        # Cosine attention per head
-        out = self.attn(q, k, v)  # [B*heads, N, head_dim, 2]
+        # split heads
+        qh = _split_heads_complex(q, self.num_heads)  # [B,H,S,hd,2]
+        kh = _split_heads_complex(k, self.num_heads)  # [B,H,S,hd,2]
+        vh = _split_heads_complex(v, self.num_heads)  # [B,H,S,hd,2]
 
-        # Merge heads: -> [B,N,H,2]
-        out = transpose_output(out, self.num_heads)
+        Qr = qh[..., 0]  # [B,H,S,hd]
+        Kr = kh[..., 0]  # [B,H,S,hd]
+
+        Qi = qh[..., 1]
+        Ki = kh[..., 1]
+
+        # Apply preprint attention to V_real and V_imag separately
+        Vr = vh[..., 0]  # [B,H,S,hd]
+        Vi = vh[..., 1]  # [B,H,S,hd]
+
+        Or = self.attn(Qr, Kr, Vr, s=s)  # [B,H,S,hd]
+        Oi = self.attn(Qi, Ki, Vi, s=s)  # [B,H,S,hd]
+
+        out_h = torch.stack([Or, Oi], dim=-1)  # [B,H,S,hd,2]
+
+        # merge heads + output proj
+        out = _merge_heads_complex(out_h)  # [B,S,hidden_dim,2]
         out = self.w_o(out)
+        return out
+
+class CosineComplexCrossAttention(nn.Module):
+    def __init__(self, n_heads, d_embed, d_cross, in_proj_bias=True, out_proj_bias=True, eps=1e-8):
+        super().__init__()
+        self.q_proj = ComplexLinear(d_embed, d_embed, bias=in_proj_bias)
+        self.k_proj = ComplexLinear(d_cross, d_embed, bias=in_proj_bias)
+        self.v_proj = ComplexLinear(d_cross, d_embed, bias=in_proj_bias)
+        self.out_proj = ComplexLinear(d_embed, d_embed, bias=out_proj_bias)
+        self.attn = CosineAttentionCausal(num_heads=n_heads, eps=eps)
+        self.n_heads = n_heads
+        self.d_head = d_embed // n_heads
+
+
+    def forward(self, x, y, s=None):
+
+        q = self.q_proj(x)
+        k = self.k_proj(y)
+        v = self.v_proj(y)
+
+        qh = _split_heads_complex(q, self.n_heads)  # [B,H,S,hd,2]
+        kh = _split_heads_complex(k, self.n_heads)  # [B,H,S,hd,2]
+        vh = _split_heads_complex(v, self.n_heads)  # [B,H,S,hd,2]
+
+        Qr = qh[..., 0]
+        Kr = kh[..., 0]  
+
+        Qi = qh[..., 1]
+        Ki = kh[..., 1]
+
+        Vr = vh[..., 0]  
+        Vi = vh[..., 1]  
+
+        Or = self.attn(Qr, Kr, Vr, s=s)  # [B,H,S,hd]
+        Oi = self.attn(Qi, Ki, Vi, s=s)  # [B,H,S,hd]
+
+        out_h = torch.stack([Or, Oi], dim=-1)  # [B,H,S,hd,2]
+
+        out = _merge_heads_complex(out_h)  # [B,S,hidden_dim,2]
+        out = self.out_proj(out)
         return out
 
 
@@ -553,16 +606,16 @@ class ComplexUNet_ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, t):
         super().__init__()
         self.groupnorm_feature = cm_l.ComplexGroupNorm(32, in_channels)
-        self.conv_features = cm_l.ComplexConv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv_features = cm_l.ComplexConv1d(in_channels, out_channels, kernel_size=3, padding=1)
         self.linear_time = ComplexLinear(t, out_channels)
 
         self.groupnorm_merged = cm_l.ComplexGroupNorm(32, out_channels)
-        self.conv_merged = cm_l.ComplexConv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv_merged = cm_l.ComplexConv1d(out_channels, out_channels, kernel_size=3, padding=1)
 
         if in_channels == out_channels:
             self.residual_layer = nn.Identity()
         else:
-            self.residual_layer = cm_l.ComplexConv2d(in_channels, out_channels, kernel_size=1, padding=0)
+            self.residual_layer = cm_l.ComplexConv1d(in_channels, out_channels, kernel_size=1, padding=0)
 
     def forward(self, feature, t):
         residue = feature
@@ -587,20 +640,20 @@ class ComplexUNet_AttentionBlock(nn.Module):
         channels = n_head + n_embd
 
         self.groupnorm = cm_l.ComplexGroupNorm(32, channels, eps=1e-6)
-        self.conv_input = cm_l.ComplexConv2d(channels, channels, kernel_size=1, padding=0)
+        self.conv_input = cm_l.ComplexConv1d(channels, channels, kernel_size=1, padding=0)
 
         self.layernorm_1 = cm_l.NaiveComplexLayerNorm(channels)
         self.attention_1 = CosineComplexMultiHeadAttention(
             n_head, channels, bias=True, eps=1e8) 
 
         self.layernorm_2 = cm_l.NaiveComplexLayerNorm(channels)
-        #self.attention_2 = CosineComplexMultiHeadAttention(
-        #    n_head, channels, d_context, bias=True, eps=attn_eps) -> Needs to be Cross Attention
+        self.attention_2 = CosineComplexCrossAttention(
+            n_head, channels, d_context, in_proj_bias=True, eps=1e8)
         self.layernorm_3 = cm_l.NaiveComplexLayerNorm(channels)
         self.linear_geglu_1 = cm_l.ComplexLinear(channels * 4, channels * 2)
         self.linear_geglu_2 = cm_l.ComplexLinear(channels * 4, channels)
 
-        self.conv_output = cm_l.ComplexConv2d(channels, channels, kernel_size=1, padding=0)
+        self.conv_output = cm_l.ComplexConv1d(channels, channels, kernel_size=1, padding=0)
 
     def forward(self, x, context):
 

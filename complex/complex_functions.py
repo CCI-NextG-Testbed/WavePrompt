@@ -46,7 +46,7 @@ def complex_leaky_relu(input, negative_slope):
     return leaky_relu(input.real, negative_slope).type(torch.complex64)+1j*leaky_relu(input.imag, negative_slope).type(torch.complex64)
 
 def complex_relu(input):
-    return relu(input.real).type(torch.complex64)+1j*relu(input.imag).type(torch.complex64)
+    return relu(input.real).type(torch.complex64) + 1j * relu(input.imag).type(torch.complex64)
 
 def complex_sigmoid(input):
     return sigmoid(input.real).type(torch.complex64)+1j*sigmoid(input.imag).type(torch.complex64)
