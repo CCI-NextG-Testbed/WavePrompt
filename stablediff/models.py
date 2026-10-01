@@ -93,22 +93,21 @@ class PositionEmbedding(nn.Module):
         table = torch.view_as_real(torch.exp(1j * table))
         return table
 
-
 class ComplexUNet(nn.Module):
 
     def __init__(self):
         super().__init__()
 
-        self.encoder = nn.Module([
+        self.encoder = nn.ModuleList([
             cm.ComplexSwitchSequential(cm_l.ComplexConv1d(4, 320, kernel_size=3, padding=1)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320),  cm.ComplexUNet_AttentionBlock(8, 40)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
             cm.ComplexSwitchSequential(cm_l.ComplexConv1d(320, 320, kernel_size=3, stride=2, padding=1)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 640),  cm.ComplexUNet_AttentionBlock(8, 80)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 640),  cm.ComplexUNet_AttentionBlock(8, 80)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
             cm.ComplexSwitchSequential(cm_l.ComplexConv1d(640, 640, kernel_size=3, stride=2, padding=1)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 1280),  cm.ComplexUNet_AttentionBlock(8, 160)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280),  cm.ComplexUNet_AttentionBlock(8, 160)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
             cm.ComplexSwitchSequential(cm_l.ComplexConv1d(1280, 1280, kernel_size=3, stride=2, padding=1)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280)),
@@ -116,26 +115,25 @@ class ComplexUNet(nn.Module):
 
         self.bottleneck = cm.ComplexSwitchSequential(
             cm.ComplexUNet_ResidualBlock(1280, 1280),
-            cm.ComplexUNet_ResidualBlock(8, 160),
+            cm.ComplexUNet_AttentionBlock(8, 160),
             cm.ComplexUNet_ResidualBlock(1280, 1280),
         )
 
-        self.decoder = nn.Module([
+        self.decoder = nn.ModuleList([
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUpSample(1280)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUpSample()),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1920, 1280), cm.ComplexUNet_AttentionBlock(8, 160), cm.ComplexUpSample(1280)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1920, 1280), cm.ComplexUNet_AttentionBlock(8, 160), cm.ComplexUpSample()),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1920, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(960, 640), cm.ComplexUNet_AttentionBlock(8, 80), cm.ComplexUpSample(640)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(960, 640), cm.ComplexUNet_AttentionBlock(8, 80), cm.ComplexUpSample()),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(960, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
             cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
         ])
 
-    
     def forward(self, x, context, time):
 
         skip_connections = []
@@ -178,13 +176,13 @@ class stablediff_Simple(nn.Module):
         self.dropout = params.dropout
         self.mlp_ratio = params.mlp_ratio
 
+        self.time_dim = 1280
+
         # Embeddings
-        self.p_embed = PositionEmbedding(params.sample_rate, self.input_dim, self.hidden_dim) # Position Embedding for complex space preservation
-        self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.hidden_dim) # Time Embedding
+        self.p_embed = PositionEmbedding(params.sample_rate, self.input_dim, self.hidden_dim)
+        self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.time_dim)
 
-        init_weight_xavier(self.text_proj)
-
-        self.bits_token = nn.Linear(1, self.hidden_dim * 2)
+        self.bits_token = nn.Linear(1, 4)
         init_weight_xavier(self.bits_token)
 
         self.unet = ComplexUNet()
@@ -192,47 +190,59 @@ class stablediff_Simple(nn.Module):
 
     def _encode_bits_seq(self, bits, device, N):
         """
-        bits: [B,N] 0/1 (or [B,N,1])
-        return: [B,N,H,2]
+        bits: [B, original_length]
+        return: [B,4,N]
         """
+
         if bits is None:
             return None
+
         if not isinstance(bits, torch.Tensor):
             bits = torch.tensor(bits, dtype=torch.float32, device=device)
         else:
             bits = bits.to(device).float()
 
         if bits.ndim == 1:
-            bits = bits.unsqueeze(0)  # [1,N]
-        if bits.shape[1] != N:
-            # If mismatch, you need a mapping from samples->symbols (oversampling etc.)
-            # For now, truncate/pad as a safe fallback:
-            if bits.shape[1] > N:
-                bits = bits[:, :N]
-            else:
-                pad = torch.zeros(bits.shape[0], N - bits.shape[1], device=device)
-                bits = torch.cat([bits, pad], dim=1)
+            bits = bits.unsqueeze(0)
 
-        bits = bits.unsqueeze(-1)  # [B,N,1]
-        B = bits.shape[0]
-        b = self.bits_token(bits)              # [B,N,2H]
-        b = b.view(B, N, self.hidden_dim, 2)   # [B,N,H,2]
-        return b
+        # [B,L] -> [B,1,L]
+        bits = bits.unsqueeze(1)
+
+        # Match latent sequence length
+        bits = F.interpolate(
+            bits,
+            size=N,
+            mode="nearest"
+        )
+
+        # [B,1,N] -> [B,N,1]
+        bits = bits.transpose(1, 2)
+
+        # Learn 1 bit feature -> 4 latent channels
+        bits = self.bits_token(bits)
+
+        # [B,N,4] -> [B,4,N]
+        bits = bits.transpose(1, 2)
+
+        return bits
 
     def forward(self, latent, time, cond):
         device = latent.device
 
-        B, N = latent.shape[0], latent.shape[1]
+        B, C, N = latent.shape
 
         prompt_input = cond.get("prompt") if isinstance(cond, dict) else cond
-        bits_input   = None
+
+        bits_input = None
         if isinstance(cond, dict):
             bits_input = cond.get("bits_cond", cond.get("bits"))
 
         time = self.t_embed(time)
-        
-        b_seq = self._encode_bits_seq(bits_input, device, N)  # [B,N,H,2] or None
+
+        b_seq = self._encode_bits_seq(bits_input, device, N)
+
         if b_seq is not None:
+            b_seq = b_seq.to(latent.dtype)
             latent = latent + b_seq
 
         output = self.unet(latent, prompt_input, time)

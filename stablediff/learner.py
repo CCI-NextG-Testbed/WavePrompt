@@ -1,13 +1,9 @@
 import numpy as np
 import os
-import glob
-import csv
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import scipy.io as scio
-import matplotlib.pyplot as plt
-from matplotlib import animation
+import math
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from stablediff.diffusion import SignalDiffusion
@@ -18,13 +14,14 @@ except Exception:
     rfml_evm = None
 
 
+
 class tfdiffLearner:
     def __init__(self, log_dir, model_dir, model, clip_model, encoder, decoder, tokenizer, dataset, optimizer, params, *args, **kwargs):
         os.makedirs(model_dir, exist_ok=True)
         self.model_dir = model_dir
         self.log_dir = log_dir
         self.model = model
-        self.clip_model = clip_model
+        self.clip = clip_model
         self.encoder = encoder
         self.decoder = decoder
         self.tokenizer = tokenizer
@@ -38,8 +35,8 @@ class tfdiffLearner:
         )
         self.params = params
         self.iter = 0
+        self.grad_norm = 0.0
         self.is_master = True
-        self.loss_fn = self.loss_fn_rf_diff if bool(getattr(params, "use_tfdiff_loss", False)) else self.loss_fn_iq_plus_bits
         self.summary_writer = None
         self.epoch_history = []
         self.epoch_train_losses = []
@@ -131,18 +128,17 @@ class tfdiffLearner:
         return x_ri
 
 
-    def _base_loss(self, target_ri, est_ri, sps=None):
-        if self.loss_fn is self.loss_fn_rf_diff:
-            return self.loss_fn(target_ri, est_ri)
-        return self.loss_fn(target_ri, est_ri, sps=sps)
-
-
     def train(self, max_iter=None):
         device = next(self.model.parameters()).device
         stop_training = False
+
         while True:  # epoch
 
             epoch_idx = self.iter // len(self.dataset)
+
+            epoch_loss_sum = 0.0
+            epoch_loss_count = 0
+
             iterator = tqdm(self.dataset, desc=f"Epoch {epoch_idx}") if self.is_master else self.dataset
 
             for features in iterator:
@@ -164,19 +160,18 @@ class tfdiffLearner:
                     loss_val = None
 
                 if loss_val is not None:
-                    epoch_loss_sum += loss_val        # <<< NEW
-                    epoch_loss_count += 1             # <<< NEW
+                    epoch_loss_sum += loss_val
+                    epoch_loss_count += 1
 
-                if torch.isnan(loss).any():
-                    raise RuntimeError(f"Detected NaN loss at iteration {self.iter}.")
+                if loss_val is not None and math.isnan(loss_val):
+                    raise RuntimeError(
+                        f"Detected NaN loss at iteration {self.iter}."
+                    )
 
                 # -------- periodic summaries --------
                 if self.is_master:
                     if self.iter % 50 == 0 and loss_val is not None:
                         self._write_summary(self.iter, features, loss)
-
-                    if self.iter % len(self.dataset) == 0:
-                        self.save_to_checkpoint()
 
                 self.iter += 1
 
@@ -185,19 +180,31 @@ class tfdiffLearner:
                 epoch_loss_mean = epoch_loss_sum / epoch_loss_count
             else:
                 epoch_loss_mean = float("nan")
+
             val_loss = float("nan")
             evm_by_mod = {}
 
-            
             if self.is_master:
                 # ---- checkpoint once per epoch ----
                 self.save_to_checkpoint()
+
                 val_loss, evm_by_mod = self._evaluate_reverse_diffusion()
+
                 self.epoch_train_losses.append(float(epoch_loss_mean))
                 self.epoch_test_losses.append(float(val_loss))
-                self._write_convergence_csv(epoch_idx, epoch_loss_mean, val_loss, evm_by_mod)
+
+                self._write_convergence_csv(
+                    epoch_idx,
+                    epoch_loss_mean,
+                    val_loss,
+                    evm_by_mod
+                )
+
                 evm_summary = " ".join(
-                    [f"{mod}_evm={evm_by_mod[mod]:.4f}" for mod in sorted(evm_by_mod.keys())]
+                    [
+                        f"{mod}_evm={evm_by_mod[mod]:.4f}"
+                        for mod in sorted(evm_by_mod.keys())
+                    ]
                 )
 
                 tqdm.write(
@@ -206,40 +213,65 @@ class tfdiffLearner:
                     f"test_loss={val_loss:.6f} "
                     f"{evm_summary}"
                 )
+
             self.epoch_history.append(int(epoch_idx))
 
             # ---- scheduler step ----
             step_metric = val_loss if self.is_master else epoch_loss_mean
             self.lr_scheduler.step(step_metric)
-            if self.is_master and bool(getattr(self.params, "animate_after_training", False)):
+
+            if self.is_master and bool(
+                getattr(self.params, "animate_after_training", False)
+            ):
                 self._save_epoch_snapshot(epoch_idx)
+
             if stop_training:
                 break
 
         self._generate_training_animation()
+
         return
 
     def train_iter(self, features):
         self.optimizer.zero_grad()
-        data = features['data']          # [B, ...]
-        prompts = features['prompt']     # list[str]
-        bits_cond = features.get('bits_cond', features.get('bits', None)) # [B, N] or None
 
-        #Call CVAE Class
-        latent = self.encoder(data)
+        data = features['data']
+        prompts = features['prompt']
+        bits_cond = features.get('bits_cond', features.get('bits', None))
+
+        # CVAE latent
+        latent = self.encoder(data)         # [B,1024]
 
         B = latent.shape[0]
-        t = torch.randint(0, self.diffusion.max_step, [B], dtype=torch.int64, device=data.device)
+
+        # Convert latent vector into Conv1d latent representation
+        latent = latent.view(B, 4, -1)      # [B,4,256]
+
+        t = torch.randint(
+            0,
+            self.diffusion.max_step,
+            [B],
+            dtype=torch.int64,
+            device=data.device
+        )
 
         degrade_data, noise = self.diffusion.degrade_fn(latent, t)
 
-        cond = {'prompt': prompts, 'bits': bits_cond}
+        cond = {
+            'prompt': prompts,
+            'bits': bits_cond
+        }
 
         tokens = self.tokenizer.batch_encode_plus(
-                [cond["prompt"]], padding="max_length", max_length=77
-            ).input_ids
-        tokens = torch.tensor(tokens, dtype=torch.long, device=data.device)
+            prompts,
+            padding="max_length",
+            truncation=True,
+            max_length=77,
+            return_tensors="pt"
+        )["input_ids"].to(data.device)
+
         context = self.clip(tokens)
+
         cond["prompt"] = context
 
         predicted_noise = self.model(degrade_data, t, cond)
@@ -247,9 +279,19 @@ class tfdiffLearner:
         loss = torch.mean(
             torch.abs(predicted_noise - noise) ** 2
         )
-        
+
         loss.backward()
+
+        grad_norm_sq = 0.0
+
+        for param in self.model.parameters():
+            if param.grad is not None:
+                grad_norm_sq += param.grad.detach().norm(2).item() ** 2
+
+        self.grad_norm = grad_norm_sq ** 0.5
+
         self.optimizer.step()
+
         return loss.item()
 
 

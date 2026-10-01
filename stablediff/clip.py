@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 import math
 
+
 class SelfAttention(nn.Module):
     def __init__(self, n_heads: int, d_embed: int, in_proj_bias=True, out_proj_bias=True):
         super().__init__()
@@ -29,7 +30,6 @@ class SelfAttention(nn.Module):
 
         if casual_mask:
             mask = torch.ones_like(weight, dtype=torch.bool).triu(1)
-
             weight.masked_fill_(mask, -torch.inf)
 
         weight /= math.sqrt(self.d_head)
@@ -39,7 +39,6 @@ class SelfAttention(nn.Module):
         output = weight @ v
 
         output = output.transpose(1, 2)
-
         output = output.reshape(input_shape)
 
         output = self.out_proj(output)
@@ -50,6 +49,7 @@ class SelfAttention(nn.Module):
 class CLIPEmbedding(nn.Module):
     def __init__(self, n_vocab: int, n_embd: int, n_tokens: int):
         super().__init__()
+
         self.token_embedding = nn.Embedding(n_vocab, n_embd)
         self.position_embedding = nn.Parameter(torch.zeros(n_tokens, n_embd))
 
@@ -67,7 +67,9 @@ class CLIPLayer(nn.Module):
 
         self.layernorm_1 = nn.LayerNorm(n_embd)
         self.attention = SelfAttention(n_head, n_embd)
+
         self.layernorm_2 = nn.LayerNorm(n_embd)
+
         self.linear_1 = nn.Linear(n_embd, n_embd * 4)
         self.linear_2 = nn.Linear(n_embd * 4, n_embd)
 
@@ -80,20 +82,31 @@ class CLIPLayer(nn.Module):
         x = self.layernorm_1(x)
         x = self.attention(x, casual_mask=True)
 
+        x += residue
+
         ## Feed-Forward
 
-        x += residue
+        residue = x
+
         x = self.layernorm_2(x)
         x = self.linear_1(x)
-        x = x * torch.sigmoid(1.702 * x) # Quicl GELU Activation
+
+        x = x * torch.sigmoid(1.702 * x)  # Quick GELU Activation
+
+        x = self.linear_2(x)
+
+        x += residue
 
         return x
 
+
 class CLIP(nn.Module):
     def __init__(self):
+        super().__init__()
+
         self.embedding = CLIPEmbedding(49408, 768, 77)
 
-        self.layers = nn.Module([
+        self.layers = nn.ModuleList([
             CLIPLayer(12, 768) for i in range(12)
         ])
 
@@ -107,6 +120,7 @@ class CLIP(nn.Module):
 
         for layer in self.layers:
             state = layer(state)
+
         output = self.layernorm(state)
 
         return output

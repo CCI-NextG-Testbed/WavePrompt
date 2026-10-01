@@ -99,6 +99,38 @@ class IQPlusSymLoss(nn.Module):
 
         return self.w_time * l_iq + self.w_evm * l_evm
 
+def get_n_per_modulation(dataloader, mods, n):
+
+    counts = {mod: 0 for mod in mods}
+    subset = []
+
+    for batch in dataloader:
+
+        modulation = batch["modulation"]
+
+        if isinstance(modulation, str):
+            modulation = [modulation]
+
+        for i, mod in enumerate(modulation):
+
+            if counts[mod] >= n:
+                continue
+
+            subset.append({
+                "data": batch["data"][i:i+1],
+                "modulation": [mod]
+            })
+
+            counts[mod] += 1
+
+        if all(counts[mod] >= n for mod in mods):
+            break
+
+    print("\nWaveforms selected:")
+    for mod in mods:
+        print(f"  {mod}: {counts[mod]}")
+
+    return subset
 
 def to_complex_samples(x):
 
@@ -186,7 +218,7 @@ def train_epoch(encoder, decoder, device, dataloader, optimizer, recon_loss):
 
         total_loss += loss.item()
 
-    return total_loss / len(dataloader.dataset)
+    return total_loss / len(dataloader)
 
 
 def evaluate_evms(encoder, decoder, device, dataloader, mods):
@@ -408,6 +440,26 @@ def main(args):
         latent_dims=args.latent_dims
     ).to(device)
 
+    if args.resume_from is not None:
+
+        checkpoint = torch.load(
+            args.resume_from,
+            map_location=device
+        )
+
+        encoder.load_state_dict(
+            checkpoint["encoder_state_dict"]
+        )
+
+        decoder.load_state_dict(
+            checkpoint["decoder_state_dict"]
+        )
+
+        print(
+            f"Loaded previous model from: "
+            f"{args.resume_from}"
+        )
+
     recon_loss = IQPlusSymLoss(
         w_time=params_simple.loss_w_time
     )
@@ -429,6 +481,13 @@ def main(args):
     train_loader = from_path(params_simple)
 
     MODS = discover_modulations(train_loader)
+
+    if args.waveforms_per_modulation is not None:
+        train_loader = get_n_per_modulation(
+            train_loader,
+            MODS,
+            args.waveforms_per_modulation
+        )
 
     fixed_samples = get_fixed_samples(train_loader)
 
@@ -617,6 +676,17 @@ if __name__ == "__main__":
         default=0.25
     )
 
+    parser.add_argument(
+        "--waveforms_per_modulation",
+        type=int,
+        default=None
+    )
+
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=params_simple.cvae_model_dir
+    )
     args = parser.parse_args()
 
     main(args)

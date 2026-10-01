@@ -289,7 +289,7 @@ def from_path_split(params, val_split=0.2, split_seed=42):
         collate_fn=Collator(params).collate,
         shuffle=True,
         num_workers=8,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=False,
         persistent_workers=True,
     )
@@ -299,7 +299,7 @@ def from_path_split(params, val_split=0.2, split_seed=42):
         collate_fn=Collator(params).collate,
         shuffle=False,
         num_workers=0,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=False,
         persistent_workers=False,
     )

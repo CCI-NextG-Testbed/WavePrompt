@@ -11,26 +11,51 @@ def rms_norm(x, target_rms=1.0, eps=1e-8):
 class SignalDiffusion(nn.Module):
     def __init__(self, params):
         super().__init__()
+
         self.params = params
-        self.N = params.sample_rate           # e.g., 512
-        # If you used extra_dim=[F] in params
-        self.F = params.extra_dim[0] if len(params.extra_dim) > 0 else 1
-        self.input_dim = self.params.sample_rate # input time-series data length, N
-        self.extra_dim = self.params.extra_dim # dimension of each data sample, e.g., [S A 2] for complex-valued CSI
-        self.max_step = self.params.max_step # maximum diffusion steps
-        beta = np.array(self.params.noise_schedule) # \beta, [T]
-        self.alpha = torch.tensor((1-beta).astype(np.float32)) # \alpha_t [T]
-        self.alpha_bar = torch.cumprod(self.alpha, dim=0) # \bar{\alpha_t}, [T]
-        self.var_blur = torch.tensor(np.array(self.params.blur_schedule).astype(np.float32)) # var of blur kernels on the frequency domain for each diffusion step
-        self.var_blur_bar = torch.cumsum(self.var_blur, dim=0) # var of blur kernels on the frequency domain, [T]
-        self.var_kernel = (self.input_dim / self.var_blur).unsqueeze(1) # var of each G_t, [T, 1]
-        self.var_kernel_bar = (self.input_dim / self.var_blur_bar).unsqueeze(1) # var of each \bar{G_t}, [T, 1]
-        self.gaussian_kernel = self.get_kernel(self.var_kernel) # G_t, [T, N]
-        self.gaussian_kernel_bar = self.get_kernel(self.var_kernel_bar) # \bar{G_t}, [T, N]
-        # The weight of original information x_0 in degraded data x_t
-        self.info_weights = self.gaussian_kernel_bar * torch.sqrt(self.alpha_bar).unsqueeze(-1) # [T, N]
-        # The overall weight of gaussian noise \epsilon in degraded data x_t
-        self.noise_weights = self.get_noise_weights() # [T, N]
+
+        self.latent_channels = 4
+        self.N = params.latent_dims // self.latent_channels
+
+        self.input_dim = self.N
+        self.max_step = params.max_step
+
+        beta = np.array(params.noise_schedule)
+
+        self.alpha = torch.tensor((1 - beta).astype(np.float32))
+        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
+
+        self.var_blur = torch.tensor(
+            np.array(params.blur_schedule).astype(np.float32)
+        )
+
+        self.var_blur_bar = torch.cumsum(
+            self.var_blur,
+            dim=0
+        )
+
+        self.var_kernel = (
+            self.input_dim / self.var_blur
+        ).unsqueeze(1)
+
+        self.var_kernel_bar = (
+            self.input_dim / self.var_blur_bar
+        ).unsqueeze(1)
+
+        self.gaussian_kernel = self.get_kernel(
+            self.var_kernel
+        )
+
+        self.gaussian_kernel_bar = self.get_kernel(
+            self.var_kernel_bar
+        )
+
+        self.info_weights = (
+            self.gaussian_kernel_bar *
+            torch.sqrt(self.alpha_bar).unsqueeze(-1)
+        )
+
+        self.noise_weights = self.get_noise_weights()
       
     def get_kernel(self, var_kernel):
         samples = torch.arange(0, self.input_dim) # [N]
@@ -87,65 +112,97 @@ class SignalDiffusion(nn.Module):
         return torch.stack(noise_weights, dim=0) # [T, N] 
 
     def degrade_fn(self, x_0, t):
+        """
+        x_0: [B, C, N] complex64
+        return:
+            x_t:   [B, C, N] complex64
+            noise: [B, C, N] complex64
+        """
+
         device = x_0.device
-        # --- ensure schedules are on same device as data ---
-        if hasattr(self, "noise_weights") and self.noise_weights.device != device:
+
+        if self.noise_weights.device != device:
             self.noise_weights = self.noise_weights.to(device)
-        if hasattr(self, "info_weights") and self.info_weights.device != device:
+
+        if self.info_weights.device != device:
             self.info_weights = self.info_weights.to(device)
 
-        noise_weight = self.noise_weights[t, :].unsqueeze(-1).unsqueeze(-1).to(device) # equivalent gaussian noise weights, [B, N, 1, 1, 1]
-        info_weight = self.info_weights[t, :].unsqueeze(-1).unsqueeze(-1).to(device) # equivalent original info weights, [B, N, 1, 1, 1]
+        noise_weight = self.noise_weights[t, :].unsqueeze(1).to(device)  # [B,1,N]
+        info_weight = self.info_weights[t, :].unsqueeze(1).to(device)    # [B,1,N]
 
-        torch.manual_seed(11)
-        noise =  noise_weight * torch.randn_like(x_0, dtype=torch.float32, device=device) # [B, N, S, A, 2]
-        x_t = info_weight * x_0 + noise # [B, N, S, A, 2]
+        noise_real = torch.randn_like(x_0.real, dtype=torch.float32, device=device)
+        noise_imag = torch.randn_like(x_0.real, dtype=torch.float32, device=device)
+
+        noise = torch.complex(noise_real, noise_imag) / np.sqrt(2.0)
+
+        noise = noise_weight * noise
+        x_t = info_weight * x_0 + noise
+
         return x_t, noise
 
 
     def sampling(self, restore_fn, cond, device):
+
         if isinstance(cond, dict):
             cond_list = cond.get('prompt')
+
             if isinstance(cond_list, str):
                 cond_list = [cond_list]
             elif isinstance(cond_list, (list, tuple)):
                 cond_list = list(cond_list)
             else:
                 raise TypeError("cond['prompt'] must be str or list[str].")
+
         else:
             if isinstance(cond, str):
                 cond_list = [cond]
             elif isinstance(cond, (list, tuple)):
                 cond_list = list(cond)
             else:
-                raise TypeError("For WiFi prompt-only generation, cond must be str or list[str] or dict with 'prompt'.")
+                raise TypeError("cond must be str, list[str], or dict.")
 
         batch_size = len(cond_list)
 
-        N = self.N   # e.g., 512
-        F = self.F   # e.g., input_dim or 1
+        N = self.N
+        C = self.latent_channels
 
-        # 1) Start from pure noise
-        data_dim = [batch_size, N, F, 2]
-        noise = torch.randn(data_dim, dtype=torch.float32, device=device)
+        noise_real = torch.randn(batch_size, C, N, device=device)
+        noise_imag = torch.randn(batch_size, C, N, device=device)
 
-        # 2) Compute global weights at max step
-        batch_max = (self.max_step - 1) * torch.ones(batch_size, dtype=torch.int64, device=device)
-        info_w  = self.info_weights[batch_max, :]      # [B, N]
-        noise_w = self.noise_weights[batch_max, :]     # [B, N]
-        inf_weight = (noise_w + info_w).unsqueeze(-1).unsqueeze(-1).to(device)   # [B, N, 1, 1]
+        noise = torch.complex(noise_real, noise_imag) / np.sqrt(2.0)
 
-        x_s = inf_weight * noise   # [B, N, F, 2]
+        batch_max = (self.max_step - 1) * torch.ones(
+            batch_size,
+            dtype=torch.int64,
+            device=device
+        )
 
-        # 3) Reverse diffusion: s = T-1 ... 0
+        info_w = self.info_weights[batch_max, :].to(device)      # [B,N]
+        noise_w = self.noise_weights[batch_max, :].to(device)   # [B,N]
+
+        inf_weight = (noise_w + info_w).unsqueeze(1)             # [B,1,N]
+
+        x_s = inf_weight * noise                                 # [B,C,N]
+
         for s in range(self.max_step - 1, -1, -1):
-            t = s * torch.ones(batch_size, dtype=torch.int64, device=device)
-            # call model/restore_fn. If original cond was a dict (contains bits), pass that
+
+            t = s * torch.ones(
+                batch_size,
+                dtype=torch.int64,
+                device=device
+            )
+
             call_cond = cond if isinstance(cond, dict) else cond_list
+
             x_0_hat = restore_fn(x_s, t, call_cond)
 
             if s > 0:
-                t_prev = (s - 1) * torch.ones(batch_size, dtype=torch.int64, device=device)
-                x_s = self.degrade_fn(x_0_hat, t_prev)
+                t_prev = (s - 1) * torch.ones(
+                    batch_size,
+                    dtype=torch.int64,
+                    device=device
+                )
+
+                x_s, _ = self.degrade_fn(x_0_hat, t_prev)
 
         return x_0_hat

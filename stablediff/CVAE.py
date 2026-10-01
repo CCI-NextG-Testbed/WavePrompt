@@ -34,10 +34,10 @@ class ComplexEncoder(nn.Module):
         # KL divergence of the most recent forward pass (filled in by ``forward``).
         self.kl = 0.0
 
-    def compute_reparam_trick(self, mu, sigma, rho):
+    def compute_reparam_trick(self, mu, sigma, delta):
 
-        numerator = sigma ** 2 * (1 - torch.abs(rho) ** 2) # sigma^2 - |delta|^2  (> 0 by construction)
-        denominator = 2 * sigma * (1 + torch.real(rho)) # 2*sigma + 2*Re(delta) (> 0 by construction)
+        numerator = sigma ** 2 * (torch.abs(delta) ** 2) # sigma^2 - |delta|^2  (> 0 by construction)
+        denominator = 2 * sigma + 2* (torch.real(delta)) # 2*sigma + 2*Re(delta) (> 0 by construction)
 
         # Signed square root: keep a real root for non-negative inputs and rotate
         # negative inputs onto the imaginary axis, so ``sqrt`` never sees a
@@ -51,7 +51,7 @@ class ComplexEncoder(nn.Module):
         denominator = torch.clamp(denominator, min=EPS)
         denominator = torch.sqrt(denominator)
 
-        kx = (sigma + rho) / denominator       # k_r, Eq. (17)
+        kx = (sigma + delta) / denominator       # k_r, Eq. (17)
         ky = 1j * numerator / denominator         # k_i, Eq. (18)
 
         # Two independent real standard-normal tensors, created on the same device
@@ -81,11 +81,11 @@ class ComplexEncoder(nn.Module):
 
     def forward(self, x):
 
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        x = self.conv5(x)
+        x = complex_relu(self.conv1(x))
+        x = complex_relu(self.conv2(x))
+        x = complex_relu(self.conv3(x))
+        x = complex_relu(self.conv4(x))
+        x = complex_relu(self.conv5(x))
         x = torch.flatten(x, start_dim=1)
 
         mu = self.mu(x)
@@ -117,7 +117,7 @@ class ComplexDecoder(nn.Module):
 
     def __init__(self, latent_dims):
         super().__init__()
-        self.hidden_dims = 1024
+        self.hidden_dims = 128
         self.lim_linear1 = ComplexLinear(latent_dims, self.hidden_dims)
         self.lim_linear2 = ComplexLinear(self.hidden_dims, FLATTENED_FEATURES)
 
@@ -138,9 +138,9 @@ class ComplexDecoder(nn.Module):
         x = self.lim_linear1(x)
         x = self.lim_linear2(x)
         x = self.unflatten(x)
-        x = self.dec1(x)
-        x = self.dec2(x)
-        x = self.dec3(x)
-        x = self.dec4(x)
+        x = complex_relu(self.dec1(x))
+        x = complex_relu(self.dec2(x))
+        x = complex_relu(self.dec3(x))
+        x = complex_relu(self.dec4(x))
         x = self.dec5(x)
         return x

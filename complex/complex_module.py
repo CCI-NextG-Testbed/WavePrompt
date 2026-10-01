@@ -9,33 +9,71 @@ import complex.complex_functions as cm_f
 
 
 def apply_complex(F_r, F_i, X):
-    X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
-    return torch.stack((F_r(X_r) - F_i(X_i), F_r(X_i) + F_i(X_r)), dim=-1)
+
+    if torch.is_complex(X):
+        X_r = X.real
+        X_i = X.imag
+
+    elif X.shape[-1] == 2:
+        X_r = X[..., 0]
+        X_i = X[..., 1]
+
+    else:
+        X_r = X
+        X_i = torch.zeros_like(X)
+
+    real = F_r(X_r) - F_i(X_i)
+    imag = F_r(X_i) + F_i(X_r)
+
+    return torch.complex(real, imag)
 
 def apply_complex_sep(F_r, F_i, X):
-    X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
-    return torch.stack((F_r(X_r), F_i(X_i)), dim=-1)
+
+    if torch.is_complex(X):
+        X_r = X.real
+        X_i = X.imag
+
+    elif X.shape[-1] == 2:
+        X_r = X[..., 0]
+        X_i = X[..., 1]
+
+    else:
+        X_r = X
+        X_i = torch.zeros_like(X)
+
+    real = F_r(X_r)
+    imag = F_i(X_i)
+
+    return torch.complex(real, imag)
 
 def _split_heads_complex(x, num_heads):
+
     """
-    x: [B, S, hidden_dim, 2]
-    returns: [B, H, S, head_dim, 2]
+    x: [B, S, hidden_dim] complex
+
+    returns: [B, H, S, head_dim] complex
     """
-    B, S, D, two = x.shape
-    assert two == 2
+
+    B, S, D = x.shape
+
     assert D % num_heads == 0
+
     hd = D // num_heads
-    return x.view(B, S, num_heads, hd, 2).permute(0, 2, 1, 3, 4).contiguous()
+
+    return x.view(B, S, num_heads, hd).permute(0, 2, 1, 3).contiguous()
 
 
 def _merge_heads_complex(x):
+
     """
-    x: [B, H, S, head_dim, 2]
-    returns: [B, S, hidden_dim, 2]
+    x: [B, H, S, head_dim] complex
+
+    returns: [B, S, hidden_dim] complex
     """
-    B, H, S, hd, two = x.shape
-    assert two == 2
-    return x.permute(0, 2, 1, 3, 4).contiguous().view(B, S, H * hd, 2)
+
+    B, H, S, hd = x.shape
+
+    return x.permute(0, 2, 1, 3).contiguous().view(B, S, H * hd)
 
 @torch.jit.script
 def complex_mul(X, Y):
@@ -384,16 +422,52 @@ class CosineAttentionCausal(nn.Module):
 
         return AttnMul.apply(Qn, Kn, Vt)
 
+class CosineAttentionCross(nn.Module):
+    def __init__(self, num_heads, eps=1e-8):
+        super().__init__()
+
+        self.eps = eps
+        self.norm_const = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
+
+    def forward(self, Q, K, V, s=None):
+
+        B, H, Sq, Dk = Q.shape
+        Sk = K.shape[2]
+
+        if s is None:
+            s = torch.tensor(
+                float(Sk),
+                device=Q.device,
+                dtype=Q.dtype
+            ).view(1, 1, 1, 1)
+
+        Qn = F.normalize(Q, dim=-1, p=2, eps=self.eps)
+        Kn = F.normalize(K, dim=-1, p=2, eps=self.eps)
+
+        scale = s ** torch.sigmoid(self.norm_const)
+
+        Vt = V / scale
+
+        scores = torch.matmul(
+            Qn,
+            Kn.transpose(-1, -2)
+        )
+
+        weights = F.softmax(scores, dim=-1)
+
+        return torch.matmul(weights, Vt)
+
 
 class CosineComplexMultiHeadAttention(nn.Module):
     """
-    Complex multi-head block in correspondence with the preprint:
-      - Uses real(Q) and real(K) for cosine-normalized Q,K (stable baseline)
-      - Applies the preprint AttnMul causal operator to V_real and V_imag separately
-      - Re-stacks into complex output
+    Complex multi-head attention:
+      - Uses real and imaginary Q/K components independently
+      - Applies cosine attention to V_real and V_imag separately
+      - Returns native complex output
     """
     def __init__(self, hidden_dim, num_heads, bias=True, eps=1e-8):
         super().__init__()
+
         self.num_heads = num_heads
         self.eps = eps
 
@@ -406,80 +480,88 @@ class CosineComplexMultiHeadAttention(nn.Module):
 
     def forward(self, x, s=None):
         """
-        queries/keys/values: [B, S, hidden_dim, 2]
-        returns:            [B, S, hidden_dim, 2]
+        x:       [B, S, hidden_dim] complex
+        returns: [B, S, hidden_dim] complex
         """
-        # project (complex)
+
         q = self.w_q(x)
         k = self.w_k(x)
         v = self.w_v(x)
 
-        # split heads
-        qh = _split_heads_complex(q, self.num_heads)  # [B,H,S,hd,2]
-        kh = _split_heads_complex(k, self.num_heads)  # [B,H,S,hd,2]
-        vh = _split_heads_complex(v, self.num_heads)  # [B,H,S,hd,2]
+        qh = _split_heads_complex(q, self.num_heads)  # [B,H,S,hd]
+        kh = _split_heads_complex(k, self.num_heads)  # [B,H,S,hd]
+        vh = _split_heads_complex(v, self.num_heads)  # [B,H,S,hd]
 
-        Qr = qh[..., 0]  # [B,H,S,hd]
-        Kr = kh[..., 0]  # [B,H,S,hd]
+        Qr = qh.real
+        Kr = kh.real
 
-        Qi = qh[..., 1]
-        Ki = kh[..., 1]
+        Qi = qh.imag
+        Ki = kh.imag
 
-        # Apply preprint attention to V_real and V_imag separately
-        Vr = vh[..., 0]  # [B,H,S,hd]
-        Vi = vh[..., 1]  # [B,H,S,hd]
+        Vr = vh.real
+        Vi = vh.imag
 
-        Or = self.attn(Qr, Kr, Vr, s=s)  # [B,H,S,hd]
-        Oi = self.attn(Qi, Ki, Vi, s=s)  # [B,H,S,hd]
+        Or = self.attn(Qr, Kr, Vr, s=s)
+        Oi = self.attn(Qi, Ki, Vi, s=s)
 
-        out_h = torch.stack([Or, Oi], dim=-1)  # [B,H,S,hd,2]
+        out_h = torch.complex(Or, Oi)  # [B,H,S,hd]
 
-        # merge heads + output proj
-        out = _merge_heads_complex(out_h)  # [B,S,hidden_dim,2]
+        out = _merge_heads_complex(out_h)  # [B,S,hidden_dim]
         out = self.w_o(out)
+
         return out
+
 
 class CosineComplexCrossAttention(nn.Module):
     def __init__(self, n_heads, d_embed, d_cross, in_proj_bias=True, out_proj_bias=True, eps=1e-8):
         super().__init__()
+
         self.q_proj = ComplexLinear(d_embed, d_embed, bias=in_proj_bias)
         self.k_proj = ComplexLinear(d_cross, d_embed, bias=in_proj_bias)
         self.v_proj = ComplexLinear(d_cross, d_embed, bias=in_proj_bias)
         self.out_proj = ComplexLinear(d_embed, d_embed, bias=out_proj_bias)
-        self.attn = CosineAttentionCausal(num_heads=n_heads, eps=eps)
+
+        self.attn = CosineAttentionCross(num_heads=n_heads, eps=eps)
+
         self.n_heads = n_heads
         self.d_head = d_embed // n_heads
 
-
     def forward(self, x, y, s=None):
+        """
+        x: [B, S, d_embed] complex
+        y: [B, T, d_cross] real or complex
+
+        returns:
+           [B, S, d_embed] complex
+        """
 
         q = self.q_proj(x)
         k = self.k_proj(y)
         v = self.v_proj(y)
 
-        qh = _split_heads_complex(q, self.n_heads)  # [B,H,S,hd,2]
-        kh = _split_heads_complex(k, self.n_heads)  # [B,H,S,hd,2]
-        vh = _split_heads_complex(v, self.n_heads)  # [B,H,S,hd,2]
+        qh = _split_heads_complex(q, self.n_heads)  # [B,H,S,hd]
+        kh = _split_heads_complex(k, self.n_heads)  # [B,H,T,hd]
+        vh = _split_heads_complex(v, self.n_heads)  # [B,H,T,hd]
 
-        Qr = qh[..., 0]
-        Kr = kh[..., 0]  
+        Qr = qh.real
+        Kr = kh.real
 
-        Qi = qh[..., 1]
-        Ki = kh[..., 1]
+        Qi = qh.imag
+        Ki = kh.imag
 
-        Vr = vh[..., 0]  
-        Vi = vh[..., 1]  
+        Vr = vh.real
+        Vi = vh.imag
 
-        Or = self.attn(Qr, Kr, Vr, s=s)  # [B,H,S,hd]
-        Oi = self.attn(Qi, Ki, Vi, s=s)  # [B,H,S,hd]
+        Or = self.attn(Qr, Kr, Vr, s=s)
+        Oi = self.attn(Qi, Ki, Vi, s=s)
 
-        out_h = torch.stack([Or, Oi], dim=-1)  # [B,H,S,hd,2]
+        out_h = torch.complex(Or, Oi)  # [B,H,S,hd]
 
-        out = _merge_heads_complex(out_h)  # [B,S,hidden_dim,2]
+        out = _merge_heads_complex(out_h)  # [B,S,d_embed]
         out = self.out_proj(out)
+
         return out
-
-
+    
 class ComplexPositionalEncoding(nn.Module):
     def __init__(self, hidden_dim, dropout, max_len=10000):
         super(ComplexPositionalEncoding, self).__init__()
@@ -603,13 +685,15 @@ class ComplexUpSample(nn.Module):
         return cm_f.complex_upsample(x, scale_factor=2)
 
 class ComplexUNet_ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, t):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.groupnorm_feature = cm_l.ComplexGroupNorm(32, in_channels)
-        self.conv_features = cm_l.ComplexConv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.linear_time = ComplexLinear(t, out_channels)
 
-        self.groupnorm_merged = cm_l.ComplexGroupNorm(32, out_channels)
+        self.groupnorm_feature = cm_l.ComplexGroupNorm(32, in_channels, eps=1e-6)
+        self.conv_feature = cm_l.ComplexConv1d(in_channels, out_channels, kernel_size=3, padding=1)
+
+        self.linear_time = ComplexLinear(1280, out_channels)
+
+        self.groupnorm_merged = cm_l.ComplexGroupNorm(32, out_channels, eps=1e-6)
         self.conv_merged = cm_l.ComplexConv1d(out_channels, out_channels, kernel_size=3, padding=1)
 
         if in_channels == out_channels:
@@ -617,17 +701,20 @@ class ComplexUNet_ResidualBlock(nn.Module):
         else:
             self.residual_layer = cm_l.ComplexConv1d(in_channels, out_channels, kernel_size=1, padding=0)
 
-    def forward(self, feature, t):
-        residue = feature
+    def forward(self, x, t):
 
-        feature = self.groupnorm_feature(feature)
+        residue = x
+
+        feature = self.groupnorm_feature(x)
         feature = cm_f.complex_silu(feature)
-        feature = self.conv_features(feature)
+        feature = self.conv_feature(feature)
 
-        t = F.silu(t)
+        t = cm_f.complex_silu(t)
         t = self.linear_time(t)
+        t = t.unsqueeze(-1)
 
-        merged = feature + t.unsqueeze(-1).unsqueeze(-1)
+        merged = feature + t
+
         merged = self.groupnorm_merged(merged)
         merged = cm_f.complex_silu(merged)
         merged = self.conv_merged(merged)
@@ -635,22 +722,27 @@ class ComplexUNet_ResidualBlock(nn.Module):
         return merged + self.residual_layer(residue)
 
 class ComplexUNet_AttentionBlock(nn.Module):
-    def __init__(self, n_head, n_embd, d_context):
+    def __init__(self, n_head, n_embd, d_context=768):
         super().__init__()
-        channels = n_head + n_embd
+
+        channels = n_head * n_embd
 
         self.groupnorm = cm_l.ComplexGroupNorm(32, channels, eps=1e-6)
         self.conv_input = cm_l.ComplexConv1d(channels, channels, kernel_size=1, padding=0)
 
         self.layernorm_1 = cm_l.NaiveComplexLayerNorm(channels)
         self.attention_1 = CosineComplexMultiHeadAttention(
-            n_head, channels, bias=True, eps=1e8) 
+            channels, n_head, bias=True, eps=1e-8
+        )
 
         self.layernorm_2 = cm_l.NaiveComplexLayerNorm(channels)
         self.attention_2 = CosineComplexCrossAttention(
-            n_head, channels, d_context, in_proj_bias=True, eps=1e8)
+            n_head, channels, d_context, in_proj_bias=True, eps=1e-8
+        )
+
         self.layernorm_3 = cm_l.NaiveComplexLayerNorm(channels)
-        self.linear_geglu_1 = cm_l.ComplexLinear(channels * 4, channels * 2)
+
+        self.linear_geglu_1 = cm_l.ComplexLinear(channels, channels * 8)
         self.linear_geglu_2 = cm_l.ComplexLinear(channels * 4, channels)
 
         self.conv_output = cm_l.ComplexConv1d(channels, channels, kernel_size=1, padding=0)
@@ -662,8 +754,7 @@ class ComplexUNet_AttentionBlock(nn.Module):
         x = self.groupnorm(x)
         x = self.conv_input(x)
 
-        n, c, h, w = x.shape
-        x = x.view((n, c, h * w)).transpose(-1, -2)  # [N, H*W, C]
+        x = x.transpose(1, 2)  # [B, N, C]
 
         residue_short = x
 
@@ -682,18 +773,31 @@ class ComplexUNet_AttentionBlock(nn.Module):
         residue_short = x
 
         x = self.layernorm_3(x)
-        x, gate = self.linear_geglu_1(x).chunk(2, dim=-1)
+
+        x = self.linear_geglu_1(x)
+
+        if not torch.is_complex(x) and x.shape[-1] == 2:
+            x = torch.view_as_complex(x.contiguous())
+
+        x, gate = x.chunk(2, dim=-1)
 
         x = x * cm_f.complex_gelu(gate)
         x = self.linear_geglu_2(x)
 
+        if not torch.is_complex(x) and x.shape[-1] == 2:
+            x = torch.view_as_complex(x.contiguous())
+
         x += residue_short
 
-        x = x.transpose(-1, -2).view((n, c, h, w))
+        x = x.transpose(1, 2)  # [B, C, N]
 
         return self.conv_output(x) + residue_long
+    
+class ComplexSwitchSequential(nn.Sequential):
+    def __init__(self, *args):
+        super().__init__(*args)
 
-class ComplexSwitchSequential(nn.Module):
+
     def forward(self, x, context, t):
         for layer in self:
             if isinstance(layer, ComplexUNet_AttentionBlock):

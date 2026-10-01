@@ -1,4 +1,6 @@
+from json import decoder
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import torch
 
 from argparse import ArgumentParser
@@ -15,7 +17,7 @@ from stablediff.model_converter import load_from_standard_weights
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 def _train_impl(replica_id, model, clip_model, encoder, decoder, tokenizer, dataset, params, val_dataset=None):
-    opt = torch.optim.AdamW(model.parameters(), lr=params.learning_rate)
+    opt = torch.optim.AdamW(model.parameters(), lr=params.learning_rate, capturable=False, foreach=False, fused=False)
     learner = tfdiffLearner(
         params.log_dir,
         params.model_dir,
@@ -36,9 +38,9 @@ def _train_impl(replica_id, model, clip_model, encoder, decoder, tokenizer, data
 
 def train(params):
     dataset, val_dataset = from_path_split(params)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     state_dict = load_from_standard_weights(
         os.path.join(params.tokenizer_dir,"v1-5-pruned-emaonly.ckpt"), device)
-    device = torch.device('cpu', 0)
 
     model = stablediff_Simple(params).to(device)
 
@@ -65,6 +67,16 @@ def train(params):
 
     encoder.eval()
     decoder.eval()
+    clip_model.eval()
+
+    for param in encoder.parameters():
+        param.requires_grad = False
+
+    for param in decoder.parameters():
+        param.requires_grad = False
+
+    for param in clip_model.parameters():
+        param.requires_grad = False
     _train_impl(0, model, clip_model, encoder, decoder, tokenizer, dataset, params, val_dataset=val_dataset)
 
 def main(args):
