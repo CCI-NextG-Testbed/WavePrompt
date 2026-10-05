@@ -9,9 +9,9 @@ import scipy.io as scio
 import torch
 import matplotlib.pyplot as plt
 
-from stablediff.diffusion import SignalDiffusion, GaussianDiffusion
-from stablediff.models import tfdiff_Simple
-from stablediff.params import AttrDict, params_simple
+from WavePrompt.stablediff_test.diffusion import SignalDiffusion, GaussianDiffusion
+from WavePrompt.stablediff_test.models import tfdiff_Simple
+from WavePrompt.stablediff_test.params import AttrDict, params_simple
 
 
 SUPPORTED_MODS = ["BPSK", "QPSK", "8PSK", "16QAM", "64QAM", "256QAM"]

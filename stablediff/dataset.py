@@ -5,7 +5,6 @@ import random
 import torch
 import torch.nn.functional as F
 import scipy.io as scio
-from stablediff.params import AttrDict
 from glob import glob
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from torch.utils.data.distributed import DistributedSampler

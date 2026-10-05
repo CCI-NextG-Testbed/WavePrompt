@@ -7,8 +7,8 @@ import imageio.v2 as imageio
 
 from tqdm import tqdm
 from stablediff.dataset import from_path
-from stablediff.params import params_simple
-from stablediff.CVAE import ComplexEncoder, ComplexDecoder
+from WavePrompt.stablediff_test.params import params_simple
+from WavePrompt.stablediff_test.CVAE import ComplexEncoder, ComplexDecoder
 
 try:
     from rfml.nn.F import evm as rfml_evm

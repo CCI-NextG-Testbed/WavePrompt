@@ -8,9 +8,9 @@ import glob
 import random
 
 
-from stablediff.CVAE import CVAE
+from WavePrompt.stablediff_test.CVAE import CVAE
 import argparse
-from stablediff.params import params_simple
+from WavePrompt.stablediff_test.params import params_simple
 
 def main(args):
 

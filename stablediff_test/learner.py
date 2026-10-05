@@ -1,110 +1,29 @@
 import numpy as np
 import os
-import glob
-import csv
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
-import scipy.io as scio
-import matplotlib.pyplot as plt
-from matplotlib import animation
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from stablediff.diffusion import SignalDiffusion
+from WavePrompt.stablediff_test.diffusion import SignalDiffusion
 from stablediff.dataset import _nested_map
 try:
     from rfml.nn.F import evm as rfml_evm
 except Exception:
     rfml_evm = None
 
-class tfdiffLoss(nn.Module):
-    def __init__(self, w=0.1):
-        super().__init__()
-        self.w = w
 
-    def forward(self, target, est, target_noise=None, est_noise=None):
-        target_c = torch.view_as_complex(target).squeeze(-1)
-        est_c = torch.view_as_complex(est).squeeze(-1)
-        target_fft = torch.fft.fft(target_c, dim=1)
-        est_fft = torch.fft.fft(est_c, dim=1)
-        t_loss = self.complex_mse_loss(target, est)
-        f_loss = torch.mean(torch.abs(target_fft - est_fft) ** 2)
-        n_loss = (
-            self.complex_mse_loss(target_noise, est_noise)
-            if target_noise is not None and est_noise is not None
-            else torch.tensor(0.0, device=target.device, dtype=target.dtype)
-        )
-        return (t_loss + f_loss + self.w * n_loss)
-
-    def complex_mse_loss(self, target, est):
-        target = torch.view_as_complex(target)
-        est = torch.view_as_complex(est)
-        return torch.mean(torch.abs(target-est)**2)
-
-class IQPlusBitsLoss(nn.Module):
-    def __init__(self, w_time=0.5, eps=1e-8):
-        super().__init__()
-        self.w_time = min(max(float(w_time), 0.0), 1.0)
-        self.w_evm = 1.0 - self.w_time
-        self.eps = eps
-
-    @staticmethod
-    def complex_mse(target_ri, est_ri):
-        # target_ri, est_ri: [B,N,1,2] float
-        target_c = torch.view_as_complex(target_ri)  # [B,N,1]
-        est_c    = torch.view_as_complex(est_ri)
-        return torch.mean(torch.abs(target_c - est_c) ** 2)
-
-    def _symbol_evm_loss(self, est_c, target_c, sps):
-        # est_c, target_c: [B,N] complex
-        B, N = est_c.shape
-        losses = []
-        for i in range(B):
-            sps_i = max(1, int(sps[i].item()))
-            T = N // sps_i
-            if T <= 0:
-                continue
-
-            est_i = est_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
-            tgt_i = target_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
-
-            if rfml_evm is not None:
-                est_ri = torch.stack((est_i.real, est_i.imag), dim=0).unsqueeze(0).unsqueeze(0)  # [1,1,2,T]
-                tgt_ri = torch.stack((tgt_i.real, tgt_i.imag), dim=0).unsqueeze(0).unsqueeze(0)  # [1,1,2,T]
-                losses.append(torch.mean(rfml_evm(est_ri, tgt_ri)))
-            else:
-                num = torch.mean(torch.abs(est_i - tgt_i) ** 2)
-                den = torch.mean(torch.abs(tgt_i) ** 2).clamp(min=self.eps)
-                losses.append(torch.sqrt(num / den))
-
-        if len(losses) == 0:
-            return torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
-        return torch.stack(losses).mean()
-
-    def forward(self, target_ri, est_ri, sps=None, return_components=False):
-        l_iq = self.complex_mse(target_ri, est_ri)
-
-        target_c = torch.view_as_complex(target_ri).squeeze(-1)  # [B,N]
-        est_c = torch.view_as_complex(est_ri).squeeze(-1)        # [B,N]
-        l_evm = torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
-        if sps is not None:
-            l_evm = self._symbol_evm_loss(est_c, target_c, sps)
-
-        if return_components:
-            return l_iq, l_evm
-
-        loss = self.w_time * l_iq + self.w_evm * l_evm
-        return loss
-        
 
 class tfdiffLearner:
-    def __init__(self, log_dir, model_dir, model, clip_model, tokenizer, dataset, optimizer, params, *args, **kwargs):
+    def __init__(self, log_dir, model_dir, model, clip_model, encoder, decoder, tokenizer, dataset, optimizer, params, *args, **kwargs):
         os.makedirs(model_dir, exist_ok=True)
         self.model_dir = model_dir
         self.log_dir = log_dir
         self.model = model
         self.clip = clip_model
+        self.encoder = encoder
+        self.decoder = decoder
         self.tokenizer = tokenizer
         self.dataset = dataset
         self.val_dataset = kwargs.get("val_dataset", None)
@@ -208,81 +127,6 @@ class tfdiffLearner:
         x_ri = torch.view_as_real(x_t).to(torch.float32)  # [N,1,2]
         return x_ri
 
-    def _evaluate_reverse_diffusion(self):
-
-        if self.val_dataset is None:
-            return float("nan"), {}
-
-        device = next(self.model.parameters()).device
-
-        was_training = self.model.training
-        self.model.eval()
-
-        loss_sum = 0.0
-        sample_count = 0
-
-        with torch.no_grad():
-
-            for features in self.val_dataset:
-
-                features = _nested_map(
-                    features,
-                    lambda x: x.to(device)
-                    if isinstance(x, torch.Tensor)
-                    else x
-                )
-
-                data = features["data"]
-                prompts = features["prompt"]
-
-                B = data.shape[0]
-
-                t = torch.randint(
-                    0,
-                    self.diffusion.max_step,
-                    [B],
-                    dtype=torch.int64,
-                    device=device
-                )
-
-                degrade_data, noise = self.diffusion.degrade_fn(
-                    data,
-                    t
-                )
-
-                tokens = self.tokenizer.batch_encode_plus(
-                    prompts,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=77,
-                    return_tensors="pt"
-                )["input_ids"].to(device)
-
-                context = self.clip_model(tokens)
-
-                predicted_noise = self.model(
-                    degrade_data,
-                    context,
-                    t
-                )
-
-                loss = torch.mean(
-                    torch.abs(predicted_noise - noise) ** 2
-                )
-
-                loss_sum += float(loss.item()) * B
-                sample_count += B
-
-        if was_training:
-            self.model.train()
-
-        if sample_count == 0:
-            return float("nan"), {}
-
-        val_loss = loss_sum / sample_count
-
-        return val_loss, {}
-
 
     def train(self, max_iter=None):
         device = next(self.model.parameters()).device
@@ -338,18 +182,37 @@ class tfdiffLearner:
                 epoch_loss_mean = float("nan")
 
             val_loss = float("nan")
+            evm_by_mod = {}
+
             if self.is_master:
                 # ---- checkpoint once per epoch ----
                 self.save_to_checkpoint()
 
-                val_loss = self._evaluate_reverse_diffusion()
-
-                print(f"Train Loss of Epoch{epoch_idx}: {epoch_loss_mean}")
-                print(f"Val Loss of Epoch{epoch_idx}: {val_loss}")
+                val_loss, evm_by_mod = self._evaluate_reverse_diffusion()
 
                 self.epoch_train_losses.append(float(epoch_loss_mean))
                 self.epoch_test_losses.append(float(val_loss))
 
+                self._write_convergence_csv(
+                    epoch_idx,
+                    epoch_loss_mean,
+                    val_loss,
+                    evm_by_mod
+                )
+
+                evm_summary = " ".join(
+                    [
+                        f"{mod}_evm={evm_by_mod[mod]:.4f}"
+                        for mod in sorted(evm_by_mod.keys())
+                    ]
+                )
+
+                tqdm.write(
+                    f"\n=== Epoch {epoch_idx} complete === "
+                    f"train_loss={epoch_loss_mean:.6f} "
+                    f"test_loss={val_loss:.6f} "
+                    f"{evm_summary}"
+                )
 
             self.epoch_history.append(int(epoch_idx))
 
@@ -357,8 +220,15 @@ class tfdiffLearner:
             step_metric = val_loss if self.is_master else epoch_loss_mean
             self.lr_scheduler.step(step_metric)
 
+            if self.is_master and bool(
+                getattr(self.params, "animate_after_training", False)
+            ):
+                self._save_epoch_snapshot(epoch_idx)
+
             if stop_training:
                 break
+
+        self._generate_training_animation()
 
         return
 
@@ -366,13 +236,16 @@ class tfdiffLearner:
         self.optimizer.zero_grad()
 
         data = features['data']
-        if data.shape[1] == 1:
-            data = data.transpose(1, 2)
-
         prompts = features['prompt']
         bits_cond = features.get('bits_cond', features.get('bits', None))
 
-        B = data.shape[0]
+        # CVAE latent
+        latent = self.encoder(data)         # [B,1024]
+
+        B = latent.shape[0]
+
+        # Convert latent vector into Conv1d latent representation
+        latent = latent.view(B, 4, -1)      # [B,4,256]
 
         t = torch.randint(
             0,
@@ -382,7 +255,12 @@ class tfdiffLearner:
             device=data.device
         )
 
-        degrade_data, noise = self.diffusion.degrade_fn(data, t)
+        degrade_data, noise = self.diffusion.degrade_fn(latent, t)
+
+        cond = {
+            'prompt': prompts,
+            'bits': bits_cond
+        }
 
         tokens = self.tokenizer.batch_encode_plus(
             prompts,
@@ -394,12 +272,9 @@ class tfdiffLearner:
 
         context = self.clip(tokens)
 
-        predicted_noise = self.model(
-            degrade_data,
-            context,
-            t,
-            bits_cond
-        )
+        cond["prompt"] = context
+
+        predicted_noise = self.model(degrade_data, t, cond)
 
         loss = torch.mean(
             torch.abs(predicted_noise - noise) ** 2
@@ -417,7 +292,7 @@ class tfdiffLearner:
 
         self.optimizer.step()
 
-        return loss
+        return loss.item()
 
 
     def _write_summary(self, iter, features, loss):

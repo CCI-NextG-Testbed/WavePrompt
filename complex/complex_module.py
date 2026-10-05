@@ -515,7 +515,6 @@ class CosineComplexMultiHeadAttention(nn.Module):
 class CosineComplexCrossAttention(nn.Module):
     def __init__(self, n_heads, d_embed, d_cross, in_proj_bias=True, out_proj_bias=True, eps=1e-8):
         super().__init__()
-
         self.q_proj = ComplexLinear(d_embed, d_embed, bias=in_proj_bias)
         self.k_proj = ComplexLinear(d_cross, d_embed, bias=in_proj_bias)
         self.v_proj = ComplexLinear(d_cross, d_embed, bias=in_proj_bias)

@@ -4,7 +4,7 @@ from complex.complex_layers import ComplexConv1d, ComplexLinear, ComplexConvTran
 from complex.complex_functions import complex_relu
 from tqdm.auto import tqdm
 from stablediff.dataset import from_path_split
-from stablediff.params import params_simple
+from WavePrompt.stablediff_test.params import params_simple
 
 
 N = params_simple['sample_rate']

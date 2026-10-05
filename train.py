@@ -1,30 +1,25 @@
-from json import decoder
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import torch
 
 from argparse import ArgumentParser
 
 from stablediff.params import params_simple
 from stablediff.learner import tfdiffLearner
-from stablediff.models import stablediff_Simple
+from stablediff.models import tfdiff_Simple
 from stablediff.clip import CLIP
-from stablediff.dataset import from_path_split
 from transformers import CLIPTokenizer
-from stablediff.CVAE import ComplexEncoder, ComplexDecoder
+from stablediff.dataset import from_path_split
 from stablediff.model_converter import load_from_standard_weights
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-def _train_impl(replica_id, model, clip_model, encoder, decoder, tokenizer, dataset, params, val_dataset=None):
-    opt = torch.optim.AdamW(model.parameters(), lr=params.learning_rate, capturable=False, foreach=False, fused=False)
+def _train_impl(replica_id, model, clip_model, tokenizer, dataset, params, val_dataset=None):
+    opt = torch.optim.AdamW(model.parameters(), lr=params.learning_rate)
     learner = tfdiffLearner(
         params.log_dir,
         params.model_dir,
         model,
         clip_model,
-        encoder,
-        decoder,
         tokenizer,
         dataset,
         opt,
@@ -42,42 +37,17 @@ def train(params):
     state_dict = load_from_standard_weights(
         os.path.join(params.tokenizer_dir,"v1-5-pruned-emaonly.ckpt"), device)
 
-    model = stablediff_Simple(params).to(device)
-
     clip_model = CLIP().to(device)
     clip_model.load_state_dict(state_dict['clip'], strict=True)
     tokenizer = CLIPTokenizer(os.path.join(params.tokenizer_dir, "vocab.json"), 
                             merges_file=os.path.join(params.tokenizer_dir, "merges.txt"))
-    
-    encoder = ComplexEncoder(params.latent_dims).to(device)
-    decoder = ComplexDecoder(params.latent_dims).to(device)
 
-    checkpoint = torch.load(
-        params.cvae_model_dir,
-        map_location=device
-    )
-
-    encoder.load_state_dict(
-        checkpoint["encoder_state_dict"]
-    )
-
-    decoder.load_state_dict(
-        checkpoint["decoder_state_dict"]
-    )
-
-    encoder.eval()
-    decoder.eval()
     clip_model.eval()
-
-    for param in encoder.parameters():
-        param.requires_grad = False
-
-    for param in decoder.parameters():
-        param.requires_grad = False
-
     for param in clip_model.parameters():
         param.requires_grad = False
-    _train_impl(0, model, clip_model, encoder, decoder, tokenizer, dataset, params, val_dataset=val_dataset)
+    
+    model = tfdiff_Simple(params, device).to(device)
+    _train_impl(0, model, clip_model, tokenizer, dataset, params, val_dataset=val_dataset)
 
 def main(args):
     params = params_simple

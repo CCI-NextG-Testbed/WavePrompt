@@ -4,11 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from sentence_transformers import SentenceTransformer
-
 import complex.complex_module as cm
-import complex.complex_layers as cm_l
-import complex.complex_functions as cm_f
 
 
 def init_weight_norm(module):
@@ -81,9 +77,12 @@ class PositionEmbedding(nn.Module):
         self.projection = cm.ComplexLinear(input_dim, hidden_dim)
         self.apply(init_weight_xavier)
 
-    def forward(self, x): 
+    def forward(self, x):
         x = self.projection(x)
-        return cm.complex_mul(x, self.embedding.to(x.device))
+        embedding = torch.view_as_complex(
+            self.embedding.to(x.device).contiguous()
+        )
+        return x * embedding
 
     def _build_embedding(self, max_len, hidden_dim):
         steps = torch.arange(max_len).unsqueeze(1)  # [P,1]
@@ -93,81 +92,80 @@ class PositionEmbedding(nn.Module):
         table = torch.view_as_real(torch.exp(1j * table))
         return table
 
-class ComplexUNet(nn.Module):
-
-    def __init__(self):
+class DiA(nn.Module):
+    def __init__(self, hidden_dim, num_heads, dropout, d_context=768, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
+        self.norm1 = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.attn = cm.CosineComplexMultiHeadAttention(
+            hidden_dim, num_heads, bias=True, eps=float(block_kwargs.get("eps", 1e-8)))
 
-        self.encoder = nn.ModuleList([
-            cm.ComplexSwitchSequential(cm_l.ComplexConv1d(4, 320, kernel_size=3, padding=1)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
-            cm.ComplexSwitchSequential(cm_l.ComplexConv1d(320, 320, kernel_size=3, stride=2, padding=1)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
-            cm.ComplexSwitchSequential(cm_l.ComplexConv1d(640, 640, kernel_size=3, stride=2, padding=1)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
-            cm.ComplexSwitchSequential(cm_l.ComplexConv1d(1280, 1280, kernel_size=3, stride=2, padding=1)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280)),
-        ])
+        self.norm2 = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.attn_2 = cm.CosineComplexCrossAttention(
+            n_heads=num_heads,
+            d_embed=hidden_dim,
+            d_cross=d_context,
+            in_proj_bias=True,
+            eps=float(block_kwargs.get("eps", 1e-8))
+        )
+        self.norm3 = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
 
-        self.bottleneck = cm.ComplexSwitchSequential(
-            cm.ComplexUNet_ResidualBlock(1280, 1280),
-            cm.ComplexUNet_AttentionBlock(8, 160),
-            cm.ComplexUNet_ResidualBlock(1280, 1280),
+        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            cm.ComplexLinear(hidden_dim, mlp_hidden_dim, bias=True),
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(mlp_hidden_dim, hidden_dim, bias=True),
         )
 
-        self.decoder = nn.ModuleList([
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUpSample()),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1920, 1280), cm.ComplexUNet_AttentionBlock(8, 160), cm.ComplexUpSample()),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1920, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(960, 640), cm.ComplexUNet_AttentionBlock(8, 80), cm.ComplexUpSample()),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(960, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
-            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
-        ])
+        self.adaLN_modulation = nn.Sequential(
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(hidden_dim, 9*hidden_dim, bias=True)
+        )
 
-    def forward(self, x, context, time):
+        self.apply(init_weight_xavier)
+        self.adaLN_modulation.apply(init_weight_zero)
 
-        skip_connections = []
+    def forward(self, x, context, t):
+        shift_msa, scale_msa, gate_msa, shift_mca, scale_mca, gate_mca, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(t).chunk(9, dim=1)
 
-        for layers in self.encoder:
-            x = layers(x, context, time)
-            skip_connections.append(x)
+        mod_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = x + gate_msa.unsqueeze(1) * self.attn(mod_x)
 
-        x = self.bottleneck(x, context, time)
+        mod_x = modulate(self.norm2(x), shift_mca, scale_mca)
+        x = x + gate_mca.unsqueeze(1) * self.attn_2(mod_x, context)
 
-        for layers in self.decoder:
-            x = torch.cat([x, skip_connections.pop()], dim=1)
-            x = layers(x, context, time)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm3(x), shift_mlp, scale_mlp))
 
         return x
 
-class ComplexUNet_OutputLayer(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_dim, out_dim):
         super().__init__()
-        self.groupnorm = cm_l.ComplexGroupNorm(num_groups=32, num_channels=in_channels)
-        self.conv = cm_l.ComplexConv1d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm = cm.NaiveComplexLayerNorm(
+            hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.linear = cm.ComplexLinear(hidden_dim, out_dim, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            cm.ComplexSiLU(),
+            cm.ComplexLinear(hidden_dim, 2*hidden_dim, bias=True)
+        )
+        self.apply(init_weight_zero)
 
-    def forward(self, x):
-        x = self.groupnorm(x)
-        x = cm_f.complex_silu(x)
-        x = self.conv(x)
+    def forward(self, x, context, t):
+        shift, scale = self.adaLN_modulation(t).chunk(2, dim=1)
+        x = modulate(self.norm(x), shift, scale)
+        x = self.linear(x)
         return x
+    
+class tfdiff_Simple(nn.Module):
 
-class stablediff_Simple(nn.Module):
-
-    def __init__(self, params):
+    def __init__(self, params, device):
         super().__init__()
         self.params = params
-        self.device = torch.device("cpu")
+        self.device = device
 
         self.input_dim = params.input_dim
         self.output_dim = getattr(params, "output_dim", params.input_dim)
@@ -176,76 +174,67 @@ class stablediff_Simple(nn.Module):
         self.dropout = params.dropout
         self.mlp_ratio = params.mlp_ratio
 
-        self.time_dim = 1280
-
         # Embeddings
-        self.p_embed = PositionEmbedding(params.sample_rate, self.input_dim, self.hidden_dim)
-        self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.time_dim)
+        self.p_embed = PositionEmbedding(params.sample_rate, self.input_dim, self.hidden_dim) # Position Embedding for complex space preservation
+        self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.hidden_dim) # Time Embedding
 
-        self.bits_token = nn.Linear(1, 4)
+
+        self.bits_token = nn.Linear(1, self.hidden_dim * 2)
         init_weight_xavier(self.bits_token)
 
-        self.unet = ComplexUNet()
-        self.final = ComplexUNet_OutputLayer(320, 4)
-
+        # Blocks + head
+        self.blocks = nn.ModuleList(
+            [DiA(self.hidden_dim, self.num_heads, self.dropout) for _ in range(params.num_block)]
+        )
+        self.final_layer = FinalLayer(self.hidden_dim, self.output_dim)
+    
     def _encode_bits_seq(self, bits, device, N):
         """
-        bits: [B, original_length]
-        return: [B,4,N]
+        bits: [B,N] 0/1 (or [B,N,1])
+        return: [B,N,H,2]
         """
-
         if bits is None:
             return None
-
         if not isinstance(bits, torch.Tensor):
             bits = torch.tensor(bits, dtype=torch.float32, device=device)
         else:
             bits = bits.to(device).float()
 
         if bits.ndim == 1:
-            bits = bits.unsqueeze(0)
+            bits = bits.unsqueeze(0)  # [1,N]
+        if bits.shape[1] != N:
+            # If mismatch, you need a mapping from samples->symbols (oversampling etc.)
+            # For now, truncate/pad as a safe fallback:
+            if bits.shape[1] > N:
+                bits = bits[:, :N]
+            else:
+                pad = torch.zeros(bits.shape[0], N - bits.shape[1], device=device)
+                bits = torch.cat([bits, pad], dim=1)
 
-        # [B,L] -> [B,1,L]
-        bits = bits.unsqueeze(1)
+        bits = bits.unsqueeze(-1)  # [B,N,1]
+        B = bits.shape[0]
+        b = self.bits_token(bits)              # [B,N,2H]
+        b = b.view(B, N, self.hidden_dim, 2)   # [B,N,H,2]
+        return b
 
-        # Match latent sequence length
-        bits = F.interpolate(
-            bits,
-            size=N,
-            mode="nearest"
-        )
+    def forward(self, x, context, t, bits_input=None):
+        device = x.device
 
-        # [B,1,N] -> [B,N,1]
-        bits = bits.transpose(1, 2)
+        B, N = x.shape[0], x.shape[1]
 
-        # Learn 1 bit feature -> 4 latent channels
-        bits = self.bits_token(bits)
+        x = self.p_embed(x)
 
-        # [B,N,4] -> [B,4,N]
-        bits = bits.transpose(1, 2)
-
-        return bits
-
-    def forward(self, latent, time, cond):
-        device = latent.device
-
-        B, C, N = latent.shape
-
-        prompt_input = cond.get("prompt") if isinstance(cond, dict) else cond
-
-        bits_input = None
-        if isinstance(cond, dict):
-            bits_input = cond.get("bits_cond", cond.get("bits"))
-
-        time = self.t_embed(time)
+        t = self.t_embed(t)
 
         b_seq = self._encode_bits_seq(bits_input, device, N)
-
         if b_seq is not None:
-            b_seq = b_seq.to(latent.dtype)
-            latent = latent + b_seq
+            if not torch.is_complex(b_seq):
+                b_seq = torch.view_as_complex(b_seq.contiguous())
+            x = x + b_seq
 
-        output = self.unet(latent, prompt_input, time)
-        output = self.final(output)
+        for block in self.blocks:
+            x = block(x, context, t)
 
-        return output
+        x = self.final_layer(x, context, t)
+
+        return x
